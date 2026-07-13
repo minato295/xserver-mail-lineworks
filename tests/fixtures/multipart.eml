@@ -1,0 +1,29 @@
+Date: Sat, 11 Jul 2026 16:05:09 +0900
+From: sender@example.invalid
+To: receiver@example.invalid
+Subject: Multipart message
+Message-ID: <multipart-fixture@example.invalid>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="outer-boundary"
+
+--outer-boundary
+Content-Type: multipart/alternative; boundary="alternative-boundary"
+
+--alternative-boundary
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+プレーン本文
+--alternative-boundary
+Content-Type: text/html; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+<p>HTML本文</p>
+--alternative-boundary--
+--outer-boundary
+Content-Type: text/plain; charset=UTF-8; name="attachment.txt"
+Content-Disposition: attachment; filename="attachment.txt"
+Content-Transfer-Encoding: 8bit
+
+ATTACHMENT_SECRET
+--outer-boundary--

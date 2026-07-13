@@ -1,0 +1,1 @@
+"""macOS launcher support."""

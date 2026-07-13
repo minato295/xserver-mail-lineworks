@@ -1,0 +1,12 @@
+{
+    "webhook_url": "https://webhook.worksmobile.com/message/REPLACE_ME",
+    "error_recipients": ["operator@example.invalid"],
+    "notification_base_address": "operator@example.invalid",
+    "notification_pinned_targets": ["base@example.invalid"],
+    "notification_targets": ["base@example.invalid", "operator@example.invalid"],
+    "log_path": "/home/example/private/log/mail-notifier.jsonl",
+    "dedup_path": "/home/example/private/state/delivery-dedup.json",
+    "soft_cap_bytes": 32768,
+    "test_force_webhook_failure_until": null,
+    "test_error_subject_token": null
+}

@@ -1,0 +1,10 @@
+Date: Sat, 11 Jul 2026 16:05:09 +0900
+From: sender@example.invalid
+To: receiver@example.invalid
+Subject: HTML message
+Message-ID: <html-fixture@example.invalid>
+MIME-Version: 1.0
+Content-Type: text/html; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+<html><head><style>.secret { display:none }</style></head><body><p>HTML本文&amp;確認</p><script>alert('SCRIPT_SECRET')</script><div>2行目です。</div></body></html>
