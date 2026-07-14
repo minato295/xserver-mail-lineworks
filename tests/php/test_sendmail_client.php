@@ -251,6 +251,17 @@ function expectSendmailFailure(callable $operation, string $expected): RuntimeEx
 }
 
 $message = "To: operator@example.invalid\r\n\r\nMESSAGE_PRIVATE_MARKER\r\n";
+$defaultWaiterAdapter = new FakeSendmailAdapter();
+$defaultWaiterClient = new SendmailClient(
+    $defaultWaiterAdapter,
+    static fn (): float => 0.0,
+);
+$defaultWaiterClient->send($message);
+sendmailCheck(
+    $defaultWaiterAdapter->handles[0]->statusCalls > 2,
+    'Default waiter must allow a running process to reach its successful exit status',
+);
+
 $adapter = new FakeSendmailAdapter();
 $client = new SendmailClient($adapter, static fn (): float => 0.0, static function (): void {});
 $client->send($message);

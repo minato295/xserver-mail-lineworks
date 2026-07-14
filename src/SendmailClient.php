@@ -30,7 +30,9 @@ final class SendmailClient
         $this->monotonicClock = Closure::fromCallable(
             $monotonicClock ?? static fn (): float => hrtime(true) / 1_000_000_000,
         );
-        $this->waiter = Closure::fromCallable($waiter ?? static fn (): bool => usleep(1000));
+        $this->waiter = Closure::fromCallable($waiter ?? static function (): void {
+            usleep(1000);
+        });
     }
 
     public function send(string $message, int $timeoutSeconds = 15): void
