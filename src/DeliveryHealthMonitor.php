@@ -14,11 +14,16 @@ use Throwable;
 final class DeliveryHealthMonitor
 {
     private const MAX_STATE_BYTES = 4096;
-    private const CLASSIFICATIONS = [
+    private const LEGACY_CLASSIFICATIONS = [
         'success', 'invalid_payload', 'invalid_parameter', 'missing_parameter',
         'invalid_webhook_url', 'rate_limited', 'http_error', 'transport_error',
         'forced_test_failure', 'internal_error', 'system_mail_suppressed',
         'health_state_failure', 'unknown',
+    ];
+    private const FAILURE_CLASSIFICATIONS = [
+        'invalid_payload', 'invalid_parameter', 'missing_parameter',
+        'invalid_webhook_url', 'rate_limited', 'http_error', 'transport_error',
+        'forced_test_failure', 'internal_error', 'health_state_failure', 'unknown',
     ];
 
     private readonly Closure $utcClock;
@@ -77,7 +82,7 @@ final class DeliveryHealthMonitor
 
     public function recordFailure(int $sequence, string $classification, string $hash): void
     {
-        $safeClassification = in_array($classification, self::CLASSIFICATIONS, true)
+        $safeClassification = in_array($classification, self::FAILURE_CLASSIFICATIONS, true)
             ? $classification : 'unknown';
         $safeHash = preg_match('/\A[a-f0-9]{64}\z/D', $hash) === 1 ? $hash : hash('sha256', $hash);
         $this->record($sequence, false, $safeClassification, $safeHash);
@@ -122,18 +127,22 @@ final class DeliveryHealthMonitor
                 if ($state['status'] === 'healthy') {
                     $mailType = 'error';
                     $mailClassification = $classification;
-                    $mailHash = $hash;
+                    $failureAt = $now;
                 } else {
                     $mailType = 'recovery';
                     $mailClassification = $state['classification'];
-                    $mailHash = $state['message_id_hash'];
-                }
-                if (!is_string($mailHash)) {
-                    throw new RuntimeException('Invalid health state');
+                    $failureAt = DateTimeImmutable::createFromFormat(
+                        '!Y-m-d\TH:i:s\Z',
+                        $state['changed_at'],
+                        new DateTimeZone('UTC'),
+                    );
+                    if (!$failureAt instanceof DateTimeImmutable) {
+                        throw new RuntimeException('Invalid health state');
+                    }
                 }
                 try {
                     $this->filesystem->assertExclusiveLockCurrent();
-                    $this->sendTransition($mailType, $now, $mailClassification, $mailHash);
+                    $this->sendTransition($mailType, $now, $failureAt, $mailClassification);
                 } catch (Throwable) {
                     $state['last_applied_sequence'] = $sequence;
                     $this->writeState($state);
@@ -159,23 +168,26 @@ final class DeliveryHealthMonitor
     private function sendTransition(
         string $type,
         DateTimeImmutable $now,
+        DateTimeImmutable $failureAt,
         string $classification,
-        string $hash,
     ): void {
         $event = ($this->eventId)();
         if (!is_string($event) || preg_match('/\A[a-f0-9]{32}\z/D', $event) !== 1) {
             throw new RuntimeException('Invalid health event');
         }
-        $body = 'UTC time: ' . $now->format('Y-m-d\TH:i:s\Z') . "\n"
-            . 'Classification: ' . $classification . "\n"
-            . 'Message-ID hash: ' . $hash . "\n"
-            . 'Operational log: ' . $this->logPath . "\n";
+        $formatted = (new SystemAlertFormatter())->format(
+            $type,
+            $now,
+            $failureAt,
+            $classification,
+        );
         $wire = $this->authenticator->build(
             $type,
             $this->recipients,
-            $now->format('D, d M Y H:i:s +0000'),
+            $formatted['date'],
             $event,
-            $body,
+            $formatted['body'],
+            $formatted['test'],
         );
         $this->sendmail->send($wire, 15);
     }
@@ -222,7 +234,7 @@ final class DeliveryHealthMonitor
             || $state['last_applied_sequence'] < 0
             || $state['last_applied_sequence'] > $state['next_observation_sequence']
             || ($status === 'degraded' && (!is_string($state['classification'] ?? null)
-                || !in_array($state['classification'], self::CLASSIFICATIONS, true)
+                || !in_array($state['classification'], self::LEGACY_CLASSIFICATIONS, true)
                 || $state['classification'] === 'success'
                 || preg_match('/\A[a-f0-9]{64}\z/D', $state['message_id_hash'] ?? '') !== 1))) {
             throw new RuntimeException('Invalid health state');

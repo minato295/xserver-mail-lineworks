@@ -144,7 +144,11 @@ final class HealthSendmailAdapter implements SendmailProcessAdapter
 }
 
 /** @return array{DeliveryHealthMonitor,FakePrivateStateFilesystem,HealthSendmailAdapter,string,string,SystemMailAuthenticator} */
-function fakeMonitor(?FakePrivateStateFilesystem $filesystem = null, ?HealthSendmailAdapter $adapter = null): array
+function fakeMonitor(
+    ?FakePrivateStateFilesystem $filesystem = null,
+    ?HealthSendmailAdapter $adapter = null,
+    ?callable $utcClock = null,
+): array
 {
     $filesystem ??= new FakePrivateStateFilesystem();
     $adapter ??= new HealthSendmailAdapter();
@@ -152,6 +156,7 @@ function fakeMonitor(?FakePrivateStateFilesystem $filesystem = null, ?HealthSend
     healthCheck(is_string($log), 'Health log fixture must exist');
     $path = '/private-test/delivery-health.json';
     $authenticator = new SystemMailAuthenticator(str_repeat('k', 32));
+    $utcClock ??= static fn (): DateTimeImmutable => new DateTimeImmutable('2026-07-13T12:00:00+00:00');
     $monitor = new DeliveryHealthMonitor(
         $path,
         ['operator@example.invalid'],
@@ -160,10 +165,35 @@ function fakeMonitor(?FakePrivateStateFilesystem $filesystem = null, ?HealthSend
         new SendmailClient($adapter, static fn (): float => 0.0, static fn (): bool => true),
         new OperationalLogger($log, static fn (): DateTimeImmutable => new DateTimeImmutable('2026-07-13T12:00:00+00:00')),
         $filesystem,
-        static fn (): DateTimeImmutable => new DateTimeImmutable('2026-07-13T12:00:00+00:00'),
+        $utcClock,
         static fn (): string => str_repeat('e', 32),
     );
     return [$monitor, $filesystem, $adapter, $path, $log, $authenticator];
+}
+
+/** @return array{headers:array<string,string>,subject:string,body:string} */
+function decodeHealthWire(string $wire): array
+{
+    $boundary = strpos($wire, "\r\n\r\n");
+    healthCheck($boundary !== false, 'Health wire must contain one header/body boundary');
+    $headers = [];
+    foreach (explode("\r\n", substr($wire, 0, $boundary)) as $line) {
+        $separator = strpos($line, ': ');
+        healthCheck($separator !== false, 'Health wire headers must use canonical syntax');
+        $headers[strtolower(substr($line, 0, $separator))] = substr($line, $separator + 2);
+    }
+    $encodedSubject = $headers['subject'] ?? '';
+    healthCheck(preg_match_all('/=\?UTF-8\?B\?([^?]+)\?=/D', $encodedSubject, $matches) > 0,
+        'Health subject must use RFC 2047 UTF-8 Base64 encoded words');
+    $subject = '';
+    foreach ($matches[1] as $chunk) {
+        $decodedChunk = base64_decode($chunk, true);
+        healthCheck(is_string($decodedChunk), 'Health subject Base64 must decode strictly');
+        $subject .= $decodedChunk;
+    }
+    $body = base64_decode(str_replace("\r\n", '', substr($wire, $boundary + 4)), true);
+    healthCheck(is_string($body), 'Health body Base64 must decode strictly');
+    return ['headers' => $headers, 'subject' => $subject, 'body' => $body];
 }
 
 [$monitor, $filesystem, $sendmail, $statePath, $logPath] = fakeMonitor();
@@ -226,7 +256,42 @@ foreach (['wrong_owner', 'replaced_inode', 'short_write', 'fsync', 'rename', 're
     unlink($faultLog);
 }
 
-[$ordered, $orderedFs, $orderedMail, $orderedPath, $orderedLog, $orderedAuth] = fakeMonitor();
+$realErrorBody = "LINE WORKSへのメール通知で障害が発生しました。\n"
+    . "復旧するまで、LINE WORKSへ通知されない可能性があります。\n\n"
+    . "【必要な対応】\n"
+    . "Xserverのメールボックスで新着メールを直接確認してください。\n"
+    . "このメールへの返信は不要です。\n\n"
+    . "障害発生日時：2026年07月14日（火）17時33分55秒\n"
+    . "障害内容：LINE WORKSに接続できませんでした。\n\n"
+    . "【管理者向け情報】\n"
+    . "原因コード：transport_error\n"
+    . "確認方法：Macの「Xserverメール通知管理」アプリで「同期診断」を実行してください。\n";
+$realRecoveryBody = "LINE WORKSへのメール通知は復旧しました。\n"
+    . "今後受信する対象メールは通常どおり通知されます。\n\n"
+    . "障害中にLINE WORKSへ通知されなかったメールは自動では再通知されません。\n\n"
+    . "【必要な対応】\n"
+    . "障害発生日時から復旧日時までの新着メールを、\n"
+    . "Xserverのメールボックスで確認してください。\n"
+    . "このメールへの返信は不要です。\n\n"
+    . "復旧日時：2026年07月14日（火）17時35分10秒\n"
+    . "障害発生日時：2026年07月14日（火）17時33分55秒\n"
+    . "障害内容：LINE WORKSに接続できませんでした。\n"
+    . "現在の状態：正常\n\n"
+    . "【管理者向け情報】\n"
+    . "原因コード：transport_error\n";
+$orderedTimes = [
+    new DateTimeImmutable('2026-07-13T12:00:00Z'),
+    new DateTimeImmutable('2026-07-14T08:33:55Z'),
+    new DateTimeImmutable('2026-07-14T08:35:10Z'),
+];
+$orderedClock = static function () use (&$orderedTimes): DateTimeImmutable {
+    $time = array_shift($orderedTimes);
+    healthCheck($time instanceof DateTimeImmutable, 'Ordered health clock must not be exhausted');
+    return $time;
+};
+[$ordered, $orderedFs, $orderedMail, $orderedPath, $orderedLog, $orderedAuth] = fakeMonitor(
+    utcClock: $orderedClock,
+);
 $older = $ordered->reserveObservation();
 $newer = $ordered->reserveObservation();
 healthCheck(is_int($older) && is_int($newer), 'Interleaved observations must reserve');
@@ -242,19 +307,39 @@ healthCheck($ordered->status() === 'degraded', 'Newest double failure must degra
 $degraded = json_decode($orderedFs->files[$orderedPath], true, 16, JSON_THROW_ON_ERROR);
 healthCheck(array_keys($degraded) === ['schema_version', 'status', 'changed_at', 'next_observation_sequence', 'last_applied_sequence', 'classification', 'message_id_hash'],
     'Degraded state must use the exact key set');
+healthCheck($degraded['changed_at'] === '2026-07-14T08:33:55Z',
+    'Outage changed_at must be stored as the injected UTC timestamp');
 healthCheck(count($orderedMail->messages) === 1 && $orderedAuth->isAuthentic($orderedMail->messages[0]),
     'First outage must send exactly one authenticated email');
+$decodedError = decodeHealthWire($orderedMail->messages[0]);
+healthCheck($decodedError['subject'] === '【要確認】LINE WORKSメール通知で障害が発生しました'
+    && $decodedError['body'] === $realErrorBody
+    && ($decodedError['headers']['date'] ?? '') === 'Tue, 14 Jul 2026 17:33:55 +0900',
+    'Real outage subject, JST Date, and decoded body must match the approved copy exactly');
+$firstChangedAt = $degraded['changed_at'];
+$firstClassification = $degraded['classification'];
 $repeated = $ordered->reserveObservation();
 $ordered->recordFailure($repeated, 'http_error', str_repeat('b', 64));
 healthCheck(count($orderedMail->messages) === 1, 'Repeated outage must be suppressed');
+$afterRepeatedFailure = json_decode($orderedFs->files[$orderedPath], true, 16, JSON_THROW_ON_ERROR);
+healthCheck($afterRepeatedFailure['changed_at'] === $firstChangedAt
+    && $afterRepeatedFailure['classification'] === $firstClassification
+    && $afterRepeatedFailure['message_id_hash'] === str_repeat('a', 64),
+    'Repeated outage must preserve the first changed_at, classification, and hash');
 $recovery = $ordered->reserveObservation();
 $ordered->recordSuccess($recovery);
 healthCheck($ordered->status() === 'healthy' && count($orderedMail->messages) === 2
     && $orderedAuth->isAuthentic($orderedMail->messages[1]), 'First recovery must send one authenticated email');
-healthCheck(str_contains($orderedMail->messages[1], 'transport_error')
-    && str_contains($orderedMail->messages[1], str_repeat('a', 64))
-    && !str_contains($orderedMail->messages[1], str_repeat('b', 64)),
-    'Recovery must use the outage classification and hash');
+$decodedRecovery = decodeHealthWire($orderedMail->messages[1]);
+healthCheck($decodedRecovery['subject'] === '【復旧・要確認】LINE WORKSメール通知が復旧しました'
+    && $decodedRecovery['body'] === $realRecoveryBody
+    && ($decodedRecovery['headers']['date'] ?? '') === 'Tue, 14 Jul 2026 17:35:10 +0900',
+    'Real recovery subject, JST Date, and decoded body must use the saved outage time exactly');
+$healthyAgain = json_decode($orderedFs->files[$orderedPath], true, 16, JSON_THROW_ON_ERROR);
+healthCheck(array_keys($healthyAgain) === [
+    'schema_version', 'status', 'changed_at', 'next_observation_sequence', 'last_applied_sequence',
+] && $healthyAgain['changed_at'] === '2026-07-14T08:35:10Z',
+    'Recovery must retain the exact healthy key set and save changed_at in UTC');
 $successAgain = $ordered->reserveObservation();
 $ordered->recordSuccess($successAgain);
 healthCheck(count($orderedMail->messages) === 2, 'Repeated healthy success must be suppressed');
@@ -263,13 +348,113 @@ foreach ($orderedMail->messages as $message) {
     healthCheck(str_ends_with($transitionBody, "\r\n")
         && !str_ends_with($transitionBody, "\r\n\r\n"),
         'Transition producer must supply exactly one terminal CRLF on the wire');
-    foreach (['ORIGINAL_FROM_MARKER', 'ORIGINAL_TO_MARKER', 'ORIGINAL_SUBJECT_MARKER',
-        'ORIGINAL_BODY_MARKER', 'EXCEPTION_MARKER', 'webhook.example.invalid', 'HMAC_KEY_MARKER'] as $secret) {
-        healthCheck(!str_contains($message, $secret), 'Health email must omit original mail and secret material');
+    $decoded = decodeHealthWire($message);
+    healthCheck(($decoded['headers']['to'] ?? '') === 'operator@example.invalid',
+        'Health wire To header must contain only the configured operator');
+    foreach (['ORIGINAL_FROM_MARKER', 'ORIGINAL_TO_MARKER', 'ORIGINAL_CC_MARKER', 'ORIGINAL_BCC_MARKER',
+        'ORIGINAL_SUBJECT_MARKER', 'ORIGINAL_BODY_MARKER', 'ORIGINAL_ATTACHMENT_MARKER',
+        'EXCEPTION_MARKER', 'https://webhook.example.invalid/PRIVATE_WEBHOOK_MARKER',
+        'HMAC_KEY_MARKER', '/private-test/operational.jsonl', str_repeat('a', 64), str_repeat('b', 64)] as $secret) {
+        healthCheck(!str_contains($message, $secret) && !str_contains($decoded['body'], $secret),
+            'Health wire and decoded body must omit original mail, secrets, hashes, and log paths');
     }
-    healthCheck(str_contains($message, '/private-test/operational.jsonl'), 'Health email must name only the private log path');
 }
 unlink($orderedLog);
+
+$testErrorBody = "これは管理者による障害通知メールの動作確認です。\n"
+    . "実際の障害ではありません。対応は不要です。\n\n"
+    . "テスト実行日時：2026年07月14日（火）17時33分55秒\n"
+    . "確認結果：障害通知メールを正常に送信しました。\n\n"
+    . "【管理者向け情報】\n"
+    . "原因コード：forced_test_failure\n";
+$testRecoveryBody = "これは管理者による復旧通知メールの動作確認です。\n"
+    . "実際の障害ではありません。対応は不要です。\n\n"
+    . "テスト実行日時：2026年07月14日（火）17時35分10秒\n"
+    . "確認結果：復旧通知メールを正常に送信しました。\n\n"
+    . "【管理者向け情報】\n"
+    . "原因コード：forced_test_failure\n";
+$testTimes = [
+    new DateTimeImmutable('2026-07-13T12:00:00Z'),
+    new DateTimeImmutable('2026-07-14T08:33:55Z'),
+    new DateTimeImmutable('2026-07-14T08:35:10Z'),
+];
+$testClock = static function () use (&$testTimes): DateTimeImmutable {
+    $time = array_shift($testTimes);
+    healthCheck($time instanceof DateTimeImmutable, 'Test transition clock must not be exhausted');
+    return $time;
+};
+[$testMonitor, , $testMail, , $testLog, $testAuth] = fakeMonitor(utcClock: $testClock);
+$testFailure = $testMonitor->reserveSyntheticFailure();
+healthCheck(is_int($testFailure), 'Synthetic outage must reserve an observation');
+$testMonitor->recordFailure($testFailure, 'forced_test_failure', str_repeat('f', 64));
+$testSuccess = $testMonitor->reserveObservation();
+healthCheck(is_int($testSuccess), 'Synthetic recovery must reserve an observation');
+$testMonitor->recordSuccess($testSuccess);
+healthCheck(count($testMail->messages) === 2
+    && $testAuth->isAuthentic($testMail->messages[0])
+    && $testAuth->isAuthentic($testMail->messages[1]),
+    'Synthetic outage and recovery must send two authenticated emails');
+$decodedTestError = decodeHealthWire($testMail->messages[0]);
+$decodedTestRecovery = decodeHealthWire($testMail->messages[1]);
+healthCheck($decodedTestError['subject'] === '【テスト・対応不要】障害通知メールの動作確認'
+    && $decodedTestError['body'] === $testErrorBody,
+    'Test outage subject and decoded body must match the approved copy exactly');
+healthCheck($decodedTestRecovery['subject'] === '【テスト・対応不要】復旧通知メールの動作確認'
+    && $decodedTestRecovery['body'] === $testRecoveryBody,
+    'Test recovery subject and decoded body must match the approved copy exactly');
+foreach ($testMail->messages as $message) {
+    $decoded = decodeHealthWire($message);
+    foreach (['ORIGINAL_FROM_MARKER', 'ORIGINAL_TO_MARKER', 'ORIGINAL_CC_MARKER', 'ORIGINAL_BCC_MARKER',
+        'ORIGINAL_SUBJECT_MARKER', 'ORIGINAL_BODY_MARKER', 'ORIGINAL_ATTACHMENT_MARKER',
+        'EXCEPTION_MARKER', 'https://webhook.example.invalid/PRIVATE_WEBHOOK_MARKER',
+        'HMAC_KEY_MARKER', '/private-test/operational.jsonl', str_repeat('f', 64)] as $secret) {
+        healthCheck(!str_contains($message, $secret) && !str_contains($decoded['body'], $secret),
+            'Synthetic health wire and decoded body must omit original mail, secrets, hashes, and log paths');
+    }
+}
+unlink($testLog);
+
+foreach (['success', 'system_mail_suppressed', 'not_allowlisted'] as $unsafeClassification) {
+    [$classificationMonitor, $classificationFs, $classificationMail, $classificationPath, $classificationLog] = fakeMonitor();
+    $classificationSequence = $classificationMonitor->reserveObservation();
+    healthCheck(is_int($classificationSequence), 'Classification failure must reserve an observation');
+    $classificationMonitor->recordFailure(
+        $classificationSequence,
+        $unsafeClassification,
+        str_repeat('9', 64),
+    );
+    $classificationState = json_decode(
+        $classificationFs->files[$classificationPath], true, 16, JSON_THROW_ON_ERROR,
+    );
+    $classificationBody = decodeHealthWire($classificationMail->messages[0])['body'];
+    healthCheck($classificationState['classification'] === 'unknown'
+        && str_contains($classificationBody, "障害内容：原因不明のメール通知エラーです。\n")
+        && str_contains($classificationBody, "原因コード：unknown\n")
+        && !str_contains($classificationBody, $unsafeClassification),
+        'Unsafe new failure classification must degrade to unknown in state and decoded body');
+    unlink($classificationLog);
+}
+
+[$legacyMonitor, $legacyFs, $legacyMail, $legacyPath, $legacyLog] = fakeMonitor(
+    utcClock: static fn (): DateTimeImmutable => new DateTimeImmutable('2026-07-14T08:35:10Z'),
+);
+$legacyFs->files[$legacyPath] = json_encode([
+    'schema_version' => 1,
+    'status' => 'degraded',
+    'changed_at' => '2026-07-14T08:33:55Z',
+    'next_observation_sequence' => 2,
+    'last_applied_sequence' => 1,
+    'classification' => 'system_mail_suppressed',
+    'message_id_hash' => str_repeat('8', 64),
+], JSON_THROW_ON_ERROR) . "\n";
+$legacyMonitor->recordSuccess(2);
+$legacyBody = decodeHealthWire($legacyMail->messages[0])['body'];
+healthCheck($legacyMonitor->status() === 'healthy'
+    && str_contains($legacyBody, "障害内容：原因不明のメール通知エラーです。\n")
+    && str_contains($legacyBody, "原因コード：unknown\n")
+    && !str_contains($legacyBody, 'system_mail_suppressed'),
+    'Legacy suppressed classification must remain readable but display as unknown during recovery');
+unlink($legacyLog);
 
 [$failedTransition, $failedFs, $failedAdapter, $failedPath, $failedLog] = fakeMonitor();
 $failedAdapter->exitCode = 1;
@@ -285,6 +470,39 @@ $failedTransition->recordFailure($retrySequence, 'transport_error', str_repeat('
 healthCheck($failedTransition->status() === 'degraded' && count($failedAdapter->messages) === 2,
     'Next new sequence must retry a failed transition email');
 unlink($failedLog);
+
+$failedRecoveryTimes = [
+    new DateTimeImmutable('2026-07-13T12:00:00Z'),
+    new DateTimeImmutable('2026-07-14T08:33:55Z'),
+    new DateTimeImmutable('2026-07-14T08:35:10Z'),
+    new DateTimeImmutable('2026-07-14T08:36:10Z'),
+];
+$failedRecoveryClock = static function () use (&$failedRecoveryTimes): DateTimeImmutable {
+    $time = array_shift($failedRecoveryTimes);
+    healthCheck($time instanceof DateTimeImmutable, 'Failed recovery clock must not be exhausted');
+    return $time;
+};
+[$failedRecovery, $failedRecoveryFs, $failedRecoveryAdapter, $failedRecoveryPath, $failedRecoveryLog] = fakeMonitor(
+    utcClock: $failedRecoveryClock,
+);
+$failedRecoveryFailure = $failedRecovery->reserveObservation();
+$failedRecovery->recordFailure($failedRecoveryFailure, 'transport_error', str_repeat('7', 64));
+$failedRecoveryAdapter->exitCode = 1;
+$failedRecoverySequence = $failedRecovery->reserveObservation();
+$failedRecovery->recordSuccess($failedRecoverySequence);
+$afterRecoverySendFailure = json_decode(
+    $failedRecoveryFs->files[$failedRecoveryPath], true, 16, JSON_THROW_ON_ERROR,
+);
+healthCheck($afterRecoverySendFailure['status'] === 'degraded'
+    && $afterRecoverySendFailure['changed_at'] === '2026-07-14T08:33:55Z'
+    && $afterRecoverySendFailure['last_applied_sequence'] === $failedRecoverySequence,
+    'Recovery sendmail failure must retain degraded state and outage time but advance the sequence');
+$failedRecoveryAdapter->exitCode = 0;
+$recoveryRetrySequence = $failedRecovery->reserveObservation();
+$failedRecovery->recordSuccess($recoveryRetrySequence);
+healthCheck($failedRecovery->status() === 'healthy' && count($failedRecoveryAdapter->messages) === 3,
+    'Next new success observation must retry a failed recovery email');
+unlink($failedRecoveryLog);
 
 [$crashMonitor, $crashFs, $crashMail, , $crashLog] = fakeMonitor();
 $crashSequence = $crashMonitor->reserveObservation();
@@ -853,4 +1071,4 @@ unlink($recursiveLock);
 rmdir($recursiveDirectory);
 rmdir($recursiveHome);
 
-fwrite(STDOUT, "PASS: monotonic private delivery health\n");
+fwrite(STDOUT, "PASS: delivery health state machine and Japanese alert contract\n");
