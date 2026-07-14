@@ -35,6 +35,7 @@ done
 php -d assert.exception=1 tests/php/test_mail_parser.php
 php -d assert.exception=1 tests/php/test_stdin_frame.php
 php -d assert.exception=1 tests/php/test_system_mail.php
+php -d assert.exception=1 tests/php/test_system_alert_formatter.php
 php -d assert.exception=1 tests/php/test_sendmail_client.php
 php -d assert.exception=1 tests/php/test_health_monitor.php
 php -d assert.exception=1 tests/php/test_delivery.php
