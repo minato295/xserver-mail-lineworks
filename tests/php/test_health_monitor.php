@@ -143,7 +143,7 @@ final class HealthSendmailAdapter implements SendmailProcessAdapter
     }
 }
 
-/** @return array{DeliveryHealthMonitor,FakePrivateStateFilesystem,HealthSendmailAdapter,string,string,SystemMailAuthenticator} */
+/** @return array{DeliveryHealthMonitor,FakePrivateStateFilesystem,HealthSendmailAdapter,string,string,SystemMailAuthenticator,string} */
 function fakeMonitor(
     ?FakePrivateStateFilesystem $filesystem = null,
     ?HealthSendmailAdapter $adapter = null,
@@ -155,7 +155,8 @@ function fakeMonitor(
     $log = tempnam(sys_get_temp_dir(), 'health-log-');
     healthCheck(is_string($log), 'Health log fixture must exist');
     $path = '/private-test/delivery-health.json';
-    $authenticator = new SystemMailAuthenticator(str_repeat('k', 32));
+    $fixtureHmacKey = 'HEALTH_MONITOR_HMAC_KEY_7f9c2d4a';
+    $authenticator = new SystemMailAuthenticator($fixtureHmacKey);
     $utcClock ??= static fn (): DateTimeImmutable => new DateTimeImmutable('2026-07-13T12:00:00+00:00');
     $monitor = new DeliveryHealthMonitor(
         $path,
@@ -168,7 +169,7 @@ function fakeMonitor(
         $utcClock,
         static fn (): string => str_repeat('e', 32),
     );
-    return [$monitor, $filesystem, $adapter, $path, $log, $authenticator];
+    return [$monitor, $filesystem, $adapter, $path, $log, $authenticator, $fixtureHmacKey];
 }
 
 /** @return array{headers:array<string,string>,subject:string,body:string} */
@@ -289,7 +290,7 @@ $orderedClock = static function () use (&$orderedTimes): DateTimeImmutable {
     healthCheck($time instanceof DateTimeImmutable, 'Ordered health clock must not be exhausted');
     return $time;
 };
-[$ordered, $orderedFs, $orderedMail, $orderedPath, $orderedLog, $orderedAuth] = fakeMonitor(
+[$ordered, $orderedFs, $orderedMail, $orderedPath, $orderedLog, $orderedAuth, $orderedHmacKey] = fakeMonitor(
     utcClock: $orderedClock,
 );
 $older = $ordered->reserveObservation();
@@ -354,7 +355,7 @@ foreach ($orderedMail->messages as $message) {
     foreach (['ORIGINAL_FROM_MARKER', 'ORIGINAL_TO_MARKER', 'ORIGINAL_CC_MARKER', 'ORIGINAL_BCC_MARKER',
         'ORIGINAL_SUBJECT_MARKER', 'ORIGINAL_BODY_MARKER', 'ORIGINAL_ATTACHMENT_MARKER',
         'EXCEPTION_MARKER', 'https://webhook.example.invalid/PRIVATE_WEBHOOK_MARKER',
-        'HMAC_KEY_MARKER', '/private-test/operational.jsonl', str_repeat('a', 64), str_repeat('b', 64)] as $secret) {
+        $orderedHmacKey, '/private-test/operational.jsonl', str_repeat('a', 64), str_repeat('b', 64)] as $secret) {
         healthCheck(!str_contains($message, $secret) && !str_contains($decoded['body'], $secret),
             'Health wire and decoded body must omit original mail, secrets, hashes, and log paths');
     }
@@ -383,7 +384,7 @@ $testClock = static function () use (&$testTimes): DateTimeImmutable {
     healthCheck($time instanceof DateTimeImmutable, 'Test transition clock must not be exhausted');
     return $time;
 };
-[$testMonitor, , $testMail, , $testLog, $testAuth] = fakeMonitor(utcClock: $testClock);
+[$testMonitor, , $testMail, , $testLog, $testAuth, $testHmacKey] = fakeMonitor(utcClock: $testClock);
 $testFailure = $testMonitor->reserveSyntheticFailure();
 healthCheck(is_int($testFailure), 'Synthetic outage must reserve an observation');
 $testMonitor->recordFailure($testFailure, 'forced_test_failure', str_repeat('f', 64));
@@ -397,17 +398,19 @@ healthCheck(count($testMail->messages) === 2
 $decodedTestError = decodeHealthWire($testMail->messages[0]);
 $decodedTestRecovery = decodeHealthWire($testMail->messages[1]);
 healthCheck($decodedTestError['subject'] === '【テスト・対応不要】障害通知メールの動作確認'
-    && $decodedTestError['body'] === $testErrorBody,
-    'Test outage subject and decoded body must match the approved copy exactly');
+    && $decodedTestError['body'] === $testErrorBody
+    && ($decodedTestError['headers']['date'] ?? '') === 'Tue, 14 Jul 2026 17:33:55 +0900',
+    'Test outage subject, JST Date, and decoded body must match the approved copy exactly');
 healthCheck($decodedTestRecovery['subject'] === '【テスト・対応不要】復旧通知メールの動作確認'
-    && $decodedTestRecovery['body'] === $testRecoveryBody,
-    'Test recovery subject and decoded body must match the approved copy exactly');
+    && $decodedTestRecovery['body'] === $testRecoveryBody
+    && ($decodedTestRecovery['headers']['date'] ?? '') === 'Tue, 14 Jul 2026 17:35:10 +0900',
+    'Test recovery subject, JST Date, and decoded body must match the approved copy exactly');
 foreach ($testMail->messages as $message) {
     $decoded = decodeHealthWire($message);
     foreach (['ORIGINAL_FROM_MARKER', 'ORIGINAL_TO_MARKER', 'ORIGINAL_CC_MARKER', 'ORIGINAL_BCC_MARKER',
         'ORIGINAL_SUBJECT_MARKER', 'ORIGINAL_BODY_MARKER', 'ORIGINAL_ATTACHMENT_MARKER',
         'EXCEPTION_MARKER', 'https://webhook.example.invalid/PRIVATE_WEBHOOK_MARKER',
-        'HMAC_KEY_MARKER', '/private-test/operational.jsonl', str_repeat('f', 64)] as $secret) {
+        $testHmacKey, '/private-test/operational.jsonl', str_repeat('f', 64)] as $secret) {
         healthCheck(!str_contains($message, $secret) && !str_contains($decoded['body'], $secret),
             'Synthetic health wire and decoded body must omit original mail, secrets, hashes, and log paths');
     }
