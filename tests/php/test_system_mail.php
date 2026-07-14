@@ -359,8 +359,10 @@ systemRejects($legacyAuth, $v1Line998, 'A 998-byte v1 authenticated header line 
 
 $v1BasePrefix = strstr(syntheticSystemMail($legacyKey, "Body\n"), "\r\n\r\n", true) . "\r\n\r\n";
 $v1Prefix65536 = syntheticSystemMail($legacyKey, "Body\n", paddingHeadersForPrefix($v1BasePrefix, 65_536));
-systemCheck(strpos($v1Prefix65536, "\r\n\r\n") + 4 === 65_536 && $legacyAuth->isAuthentic($v1Prefix65536),
-    'v1 header prefix of exactly 65536 bytes must remain scanned');
+systemCheck(strlen($v1Prefix65536) > 65_536
+    && strpos($v1Prefix65536, "\r\n\r\n") + 4 === 65_536
+    && $legacyAuth->isAuthentic($v1Prefix65536),
+    'v1 total wire may exceed 65536 bytes when its compatible header prefix remains within the scan limit');
 $v1Prefix65537 = syntheticSystemMail($legacyKey, "Body\n", paddingHeadersForPrefix($v1BasePrefix, 65_537));
 systemRejects($legacyAuth, $v1Prefix65537, 'v1 header prefix of 65537 bytes must remain outside the scan limit');
 
@@ -509,7 +511,14 @@ systemCheck(isset($sizeVectors[65_536], $sizeVectors[65_537]), 'Independent vect
 [$recipient65536, $body65536] = $sizeVectors[65_536];
 systemCheck(strlen($auth->build('error', [$recipient65536], $date, $event, $body65536)) === 65_536,
     'A canonical post-Base64 v2 wire of exactly 65536 bytes must be accepted');
+$external65536 = syntheticV2($keyBytes, $body65536, event: $event, to: $recipient65536);
+systemCheck(strlen($external65536) === 65_536 && $auth->isAuthentic($external65536),
+    'An externally framed genuine v2 wire of exactly 65536 bytes must authenticate');
 [$recipient65537, $body65537] = $sizeVectors[65_537];
+$external65537 = syntheticV2($keyBytes, $body65537, event: $event, to: $recipient65537);
+systemCheck(strlen($external65537) === 65_537, 'External rejected v2 fixture must be exactly 65537 bytes');
+systemRejects($auth, $external65537,
+    'An externally framed genuine v2 wire of 65537 bytes must be rejected before authentication');
 try {
     $auth->build('error', [$recipient65537], $date, $event, $body65537);
     throw new RuntimeException('A canonical post-Base64 v2 wire of 65537 bytes was accepted');

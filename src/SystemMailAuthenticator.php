@@ -132,7 +132,8 @@ final class SystemMailAuthenticator
         $rawBody = substr($raw, $boundary['bodyOffset']);
         return match ($headers['x-xserver-mail-notifier-version'][0]) {
             '1' => $this->authenticateV1($headers, $rawBody),
-            '2' => $this->authenticateV2($headers, $rawBody),
+            '2' => strlen($raw) <= self::MAX_MESSAGE_BYTES
+                && $this->authenticateV2($headers, $rawBody),
             default => false,
         };
     }
