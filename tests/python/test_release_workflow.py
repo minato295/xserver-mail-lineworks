@@ -304,7 +304,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
             path.chmod(0o700 if relative.startswith("bin/") else 0o600)
         repository = Path(__file__).resolve().parents[2]
         for name in (
-            "CanonicalEmail.php", "SystemMailAuthenticator.php", "SendmailClient.php",
+            "CanonicalEmail.php", "SystemMailAuthenticator.php", "SystemAlertFormatter.php", "SendmailClient.php",
             "SendmailProcessAdapter.php", "NativeSendmailProcessAdapter.php",
             "DeliveryHealthMonitor.php", "PrivateStateFilesystem.php",
             "NativePrivateStateFilesystem.php",
@@ -893,7 +893,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
         )
         runtime = {item["path"]: item for item in stable["runtime"]}
         for name in (
-            "CanonicalEmail.php", "SystemMailAuthenticator.php", "SendmailClient.php",
+            "CanonicalEmail.php", "SystemMailAuthenticator.php", "SystemAlertFormatter.php", "SendmailClient.php",
             "SendmailProcessAdapter.php", "NativeSendmailProcessAdapter.php",
             "DeliveryHealthMonitor.php", "PrivateStateFilesystem.php",
             "NativePrivateStateFilesystem.php",

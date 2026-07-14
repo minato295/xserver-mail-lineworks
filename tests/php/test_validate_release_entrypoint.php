@@ -34,7 +34,7 @@ usort($entries, static fn(array $a, array $b): int => strcmp($a['path'], $b['pat
 $entriesByPath = [];
 foreach ($entries as $entry) $entriesByPath[$entry['path']] = $entry;
 foreach ([
-    'CanonicalEmail.php', 'SystemMailAuthenticator.php', 'SendmailClient.php',
+    'CanonicalEmail.php', 'SystemMailAuthenticator.php', 'SystemAlertFormatter.php', 'SendmailClient.php',
     'SendmailProcessAdapter.php', 'NativeSendmailProcessAdapter.php',
     'DeliveryHealthMonitor.php', 'PrivateStateFilesystem.php',
     'NativePrivateStateFilesystem.php',

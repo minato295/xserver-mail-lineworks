@@ -28,7 +28,7 @@ mkdir($root . '/bin', 0700); chmod($root . '/bin', 0700);
 mkdir($root . '/vendor', 0700); chmod($root . '/vendor', 0700);
 mkdir($root . '/src', 0700); chmod($root . '/src', 0700);
 $runtimeDependencies = [
-    'CanonicalEmail.php', 'SystemMailAuthenticator.php', 'SendmailClient.php',
+    'CanonicalEmail.php', 'SystemMailAuthenticator.php', 'SystemAlertFormatter.php', 'SendmailClient.php',
     'SendmailProcessAdapter.php', 'NativeSendmailProcessAdapter.php',
     'DeliveryHealthMonitor.php', 'PrivateStateFilesystem.php',
     'NativePrivateStateFilesystem.php',

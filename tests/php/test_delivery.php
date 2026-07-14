@@ -26,6 +26,30 @@ function deliveryCheck(bool $condition, string $message): void
     }
 }
 
+/** @return array{headers:array<string,string>,subject:string,body:string} */
+function decodeDeliverySystemWire(string $wire): array
+{
+    $boundary = strpos($wire, "\r\n\r\n");
+    deliveryCheck($boundary !== false, 'System wire must contain a CRLF header boundary');
+    $headers = [];
+    foreach (explode("\r\n", substr($wire, 0, $boundary)) as $line) {
+        $separator = strpos($line, ': ');
+        deliveryCheck($separator !== false, 'System wire headers must use canonical syntax');
+        $headers[strtolower(substr($line, 0, $separator))] = substr($line, $separator + 2);
+    }
+    $subject = '';
+    deliveryCheck(preg_match_all('/=\?UTF-8\?B\?([^?]+)\?=/D', $headers['subject'] ?? '', $matches) > 0,
+        'System subject must use RFC 2047 UTF-8 Base64 encoded words');
+    foreach ($matches[1] as $chunk) {
+        $decoded = base64_decode($chunk, true);
+        deliveryCheck(is_string($decoded), 'System subject must strict-decode');
+        $subject .= $decoded;
+    }
+    $body = base64_decode(str_replace("\r\n", '', substr($wire, $boundary + 4)), true);
+    deliveryCheck(is_string($body), 'System body must strict-decode');
+    return ['headers' => $headers, 'subject' => $subject, 'body' => $body];
+}
+
 /** @return list<string> */
 function boundaryAddresses(int $count, ?int $toBytes = null): array
 {
@@ -629,8 +653,8 @@ $healthDirectory = sys_get_temp_dir() . '/delivery-health-integration-' . bin2he
 mkdir($healthDirectory, 0700);
 $healthDirectory = realpath($healthDirectory);
 deliveryCheck(is_string($healthDirectory), 'Health integration directory must resolve');
-$healthLog = $healthDirectory . '/operational.jsonl';
-$healthAuth = new SystemMailAuthenticator(str_repeat('h', 32));
+$healthLog = $healthDirectory . '/operational-LOG_PATH_MARKER.jsonl';
+$healthAuth = new SystemMailAuthenticator(str_pad('HMAC_KEY_MARKER', 32, '_'));
 $healthSendmailAdapter = new DeliverySendmailAdapter();
 $healthMonitor = new DeliveryHealthMonitor(
     $healthDirectory . '/delivery-health.json', ['operator@example.invalid'], $healthLog,
@@ -646,7 +670,7 @@ $healthMonitor = new DeliveryHealthMonitor(
 );
 $observedCalls = 0;
 $observedWebhook = new WebhookClient(
-    'https://webhook.example.invalid/message/test',
+    'https://webhook.example.invalid/PRIVATE_WEBHOOK_MARKER',
     static function () use (&$observedCalls): array {
         ++$observedCalls;
         if ($observedCalls <= 2) {
@@ -668,8 +692,15 @@ $observedApplication = new DeliveryApplication(
 );
 $sensitiveRaw = "From: ORIGINAL_FROM_MARKER@example.invalid\r\n"
     . "To: ORIGINAL_TO_MARKER@example.invalid\r\n"
+    . "Cc: ORIGINAL_CC_MARKER@example.invalid\r\n"
+    . "Bcc: ORIGINAL_BCC_MARKER@example.invalid\r\n"
     . "Subject: ORIGINAL_SUBJECT_MARKER\r\n"
-    . "Message-ID: <sensitive@example.invalid>\r\n\r\nORIGINAL_BODY_MARKER";
+    . "Message-ID: <sensitive@example.invalid>\r\n"
+    . "Content-Type: multipart/mixed; boundary=privacy\r\n\r\n"
+    . "--privacy\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\nORIGINAL_BODY_MARKER\r\n"
+    . "--privacy\r\nContent-Type: application/octet-stream\r\n"
+    . "Content-Disposition: attachment; filename=ORIGINAL_ATTACHMENT_MARKER.txt\r\n\r\nattachment\r\n"
+    . "--privacy--\r\n";
 $observedApplication->deliver($sensitiveRaw);
 deliveryCheck($observedCalls === 2 && $healthMonitor->status() === 'degraded'
     && count($healthSendmailAdapter->messages) === 1,
@@ -679,11 +710,18 @@ $degradedIntegration = json_decode((string) file_get_contents(
 deliveryCheck($degradedIntegration['next_observation_sequence'] === 2
     && $degradedIntegration['last_applied_sequence'] === 2,
     'Normal and error webhooks must reserve separate observations and apply only the error result');
-foreach (['ORIGINAL_FROM_MARKER', 'ORIGINAL_TO_MARKER', 'ORIGINAL_SUBJECT_MARKER',
-    'ORIGINAL_BODY_MARKER', 'EXCEPTION_MARKER', 'webhook.example.invalid', 'HMAC_KEY_MARKER'] as $privateMarker) {
-    deliveryCheck(!str_contains($healthSendmailAdapter->messages[0], $privateMarker),
-        'Outage email must omit original mail, exception, webhook, and key material');
-}
+$expectedRealErrorBody = "LINE WORKSへのメール通知で障害が発生しました。\n"
+    . "復旧するまで、LINE WORKSへ通知されない可能性があります。\n\n"
+    . "【必要な対応】\nXserverのメールボックスで新着メールを直接確認してください。\n"
+    . "このメールへの返信は不要です。\n\n"
+    . "障害発生日時：2026年07月13日（月）21時00分00秒\n"
+    . "障害内容：LINE WORKSに接続できませんでした。\n\n"
+    . "【管理者向け情報】\n原因コード：transport_error\n"
+    . "確認方法：Macの「Xserverメール通知管理」アプリで「同期診断」を実行してください。\n";
+$decodedRealError = decodeDeliverySystemWire($healthSendmailAdapter->messages[0]);
+deliveryCheck($decodedRealError['subject'] === '【要確認】LINE WORKSメール通知で障害が発生しました'
+    && $decodedRealError['body'] === $expectedRealErrorBody,
+    'Integrated outage subject and body must match the approved Japanese copy');
 $observedApplication->deliver($otherRaw);
 deliveryCheck($observedCalls === 3 && $healthMonitor->status() === 'healthy'
     && count($healthSendmailAdapter->messages) === 2,
@@ -693,6 +731,34 @@ $healthyIntegration = json_decode((string) file_get_contents(
 deliveryCheck($healthyIntegration['next_observation_sequence'] === 3
     && $healthyIntegration['last_applied_sequence'] === 3,
     'Logical success must reserve and apply exactly one observation');
+$expectedRealRecoveryBody = "LINE WORKSへのメール通知は復旧しました。\n"
+    . "今後受信する対象メールは通常どおり通知されます。\n\n"
+    . "障害中にLINE WORKSへ通知されなかったメールは自動では再通知されません。\n\n"
+    . "【必要な対応】\n障害発生日時から復旧日時までの新着メールを、\n"
+    . "Xserverのメールボックスで確認してください。\nこのメールへの返信は不要です。\n\n"
+    . "復旧日時：2026年07月13日（月）21時00分00秒\n"
+    . "障害発生日時：2026年07月13日（月）21時00分00秒\n"
+    . "障害内容：LINE WORKSに接続できませんでした。\n現在の状態：正常\n\n"
+    . "【管理者向け情報】\n原因コード：transport_error\n";
+$decodedRealRecovery = decodeDeliverySystemWire($healthSendmailAdapter->messages[1]);
+deliveryCheck($decodedRealRecovery['subject'] === '【復旧・要確認】LINE WORKSメール通知が復旧しました'
+    && $decodedRealRecovery['body'] === $expectedRealRecoveryBody,
+    'Integrated recovery subject and body must match the approved Japanese copy');
+$sensitiveHash = hash('sha256', 'sensitive@example.invalid');
+foreach ($healthSendmailAdapter->messages as $message) {
+    $decodedMessage = decodeDeliverySystemWire($message);
+    deliveryCheck(($decodedMessage['headers']['to'] ?? '') === 'operator@example.invalid',
+        'Integrated system mail To must contain only the configured notification recipient');
+    foreach (['ORIGINAL_FROM_MARKER', 'ORIGINAL_TO_MARKER', 'ORIGINAL_CC_MARKER',
+        'ORIGINAL_BCC_MARKER', 'ORIGINAL_SUBJECT_MARKER', 'ORIGINAL_BODY_MARKER',
+        'ORIGINAL_ATTACHMENT_MARKER', 'PRIVATE_WEBHOOK_MARKER', 'EXCEPTION_MARKER',
+        'HMAC_KEY_MARKER', 'LOG_PATH_MARKER', $sensitiveHash] as $privateMarker) {
+        deliveryCheck(!str_contains($message, $privateMarker)
+            && !str_contains($decodedMessage['subject'], $privateMarker)
+            && !str_contains($decodedMessage['body'], $privateMarker),
+            'System mail raw wire, decoded subject, and decoded body must omit integration sentinels');
+    }
+}
 
 $rateObservedCalls = 0;
 $rateObservedClient = new WebhookClient(
@@ -777,11 +843,12 @@ $forcedObservedReporter = new ErrorReporter(
     $forcedObservedWebhook, new OperationalLogger($forcedHealthLog),
     $forcedHealthMonitor,
 );
-(new DeliveryApplication(
+$forcedApplication = new DeliveryApplication(
     $forcedObservedWebhook, $forcedObservedReporter, new OperationalLogger($forcedHealthLog),
     $armedConfig, null, $healthAuth, $forcedHealthMonitor,
     static fn (): DateTimeImmutable => new DateTimeImmutable('2026-07-13T12:00:00+00:00'),
-))->deliver($forcedRaw);
+);
+$forcedApplication->deliver($forcedRaw);
 deliveryCheck($forcedObservedCalls === 0 && $forcedHealthMonitor->status() === 'degraded'
     && count($forcedHealthAdapter->messages) === 1,
     'Token-matched forced test must reserve one synthetic failure with zero HTTP');
@@ -790,6 +857,28 @@ $forcedState = json_decode((string) file_get_contents(
 deliveryCheck($forcedState['next_observation_sequence'] === 1
     && $forcedState['last_applied_sequence'] === 1,
     'Forced test must reserve and apply exactly one synthetic observation');
+$forcedApplication->deliver($otherRaw);
+deliveryCheck($forcedObservedCalls === 1 && $forcedHealthMonitor->status() === 'healthy'
+    && count($forcedHealthAdapter->messages) === 2,
+    'Ordinary successful delivery after forced outage must produce one test recovery transition');
+$expectedTestErrorBody = "これは管理者による障害通知メールの動作確認です。\n"
+    . "実際の障害ではありません。対応は不要です。\n\n"
+    . "テスト実行日時：2026年07月13日（月）21時00分00秒\n"
+    . "確認結果：障害通知メールを正常に送信しました。\n\n"
+    . "【管理者向け情報】\n原因コード：forced_test_failure\n";
+$expectedTestRecoveryBody = "これは管理者による復旧通知メールの動作確認です。\n"
+    . "実際の障害ではありません。対応は不要です。\n\n"
+    . "テスト実行日時：2026年07月13日（月）21時00分00秒\n"
+    . "確認結果：復旧通知メールを正常に送信しました。\n\n"
+    . "【管理者向け情報】\n原因コード：forced_test_failure\n";
+$decodedTestError = decodeDeliverySystemWire($forcedHealthAdapter->messages[0]);
+$decodedTestRecovery = decodeDeliverySystemWire($forcedHealthAdapter->messages[1]);
+deliveryCheck($decodedTestError['subject'] === '【テスト・対応不要】障害通知メールの動作確認'
+    && $decodedTestError['body'] === $expectedTestErrorBody,
+    'Forced outage subject and body must match the approved Japanese copy');
+deliveryCheck($decodedTestRecovery['subject'] === '【テスト・対応不要】復旧通知メールの動作確認'
+    && $decodedTestRecovery['body'] === $expectedTestRecoveryBody,
+    'Forced recovery subject and body must match the approved Japanese copy');
 
 $preflightDirectory = sys_get_temp_dir() . '/delivery-preflight-' . bin2hex(random_bytes(8));
 mkdir($preflightDirectory, 0700);
@@ -821,38 +910,46 @@ $preflightReporter = new ErrorReporter(
     $preflightWebhook, $preflightLogger, $preflightMonitor,
 );
 $preflightDedupPath = $preflightDirectory . '/delivery-dedup.json';
+$preflightAuth = new SystemMailAuthenticator(str_repeat('k', 32));
 $preflightApplication = new DeliveryApplication(
     $preflightWebhook, $preflightReporter, $preflightLogger, null,
-    new DeliveryDeduplicator($preflightDedupPath), $healthAuth, $preflightMonitor,
+    new DeliveryDeduplicator($preflightDedupPath), $preflightAuth, $preflightMonitor,
     static fn (): DateTimeImmutable => new DateTimeImmutable('2026-07-13T12:00:00+00:00'),
     static function () use (&$preflightParser): never { ++$preflightParser; throw new RuntimeException('parser called'); },
 );
-$systemWire = $healthAuth->build(
-    'error', ['operator@example.invalid'], 'Mon, 13 Jul 2026 12:00:00 +0000',
-    str_repeat('7', 32), "UTC time: 2026-07-13T12:00:00Z\nClassification: transport_error\n"
-        . 'Message-ID hash: ' . str_repeat('8', 64) . "\nOperational log: /private/example.invalid/operational.jsonl\n",
+$systemWire = $preflightAuth->build(
+    'error', ['operator@example.invalid'], 'Mon, 13 Jul 2026 21:00:00 +0900',
+    str_repeat('7', 32), "統合テスト本文\n", false,
 );
-$preflightApplication->deliver($systemWire);
+$legacySystemWire = file_get_contents(dirname(__DIR__) . '/fixtures/system-mail-v1-postfix.eml');
+deliveryCheck(is_string($legacySystemWire), 'Fixed Postfix v1 fixture must be readable for delivery preflight');
+$legacySystemWire = str_replace("\n", "\r\n", str_replace("\r\n", "\n", $legacySystemWire));
+foreach ([$systemWire, $legacySystemWire] as $authenticSystemWire) {
+    $preflightApplication->deliver($authenticSystemWire);
+}
 deliveryCheck($preflightParser === 0 && $preflightHttp === 0 && $preflightAdapter->messages === []
     && !file_exists($preflightDedupPath)
     && !file_exists($preflightDirectory . '/delivery-health.json'),
     'Authentic system mail must stop before parser, dedup, health, webhook, and sendmail');
-$preflightEvents = array_values(array_filter(explode("\n", (string) file_get_contents($preflightLog))));
-deliveryCheck(count($preflightEvents) === 1
-    && json_decode($preflightEvents[0], true, 16, JSON_THROW_ON_ERROR)['classification'] === 'system_mail_suppressed',
-    'Authentic system mail must emit only the allowlisted suppression log');
+$preflightEvents = array_map(
+    static fn (string $line): array => json_decode($line, true, 16, JSON_THROW_ON_ERROR),
+    array_values(array_filter(explode("\n", (string) file_get_contents($preflightLog)))),
+);
+deliveryCheck(count($preflightEvents) === 2
+    && array_column($preflightEvents, 'classification') === ['system_mail_suppressed', 'system_mail_suppressed'],
+    'Authentic v2 and fixed Postfix v1 system mail must emit only suppression logs');
 
 foreach ([
     'missing' => str_replace("X-Xserver-Mail-Notifier-Auth: ", "X-Removed-Auth: ", $systemWire),
-    'duplicate' => str_replace("Subject: Xserver", "Subject: Xserver\r\nSubject: Xserver", $systemWire),
-    'body-mutated' => str_replace('transport_error', 'transport_error_changed', $systemWire),
-    'replay-mutated' => $healthAuth->build('recovery', ['operator@example.invalid'],
-        'Mon, 13 Jul 2026 12:00:00 +0000', str_repeat('9', 32), "different body\n") . 'changed',
+    'duplicate' => "X-Xserver-Mail-Notifier-Type: error\r\n" . $systemWire,
+    'body-mutated' => $systemWire . 'changed',
+    'replay-mutated' => $preflightAuth->build('recovery', ['operator@example.invalid'],
+        'Mon, 13 Jul 2026 21:00:00 +0900', str_repeat('9', 32), "different body\n", false) . 'changed',
 ] as $forgeryName => $forgedWire) {
     $callsBefore = $preflightHttp;
     $ordinaryApplication = new DeliveryApplication(
         $preflightWebhook, $preflightReporter, $preflightLogger, null, null,
-        $healthAuth, $preflightMonitor,
+        $preflightAuth, $preflightMonitor,
         static fn (): DateTimeImmutable => new DateTimeImmutable('2026-07-13T12:00:00+00:00'),
     );
     $ordinaryApplication->deliver($forgedWire);
