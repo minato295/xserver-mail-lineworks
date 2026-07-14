@@ -1,0 +1,19 @@
+Return-Path: <notifier@example.invalid>
+Received: from relay.example.invalid (relay.example.invalid [192.0.2.10])
+	by mx.example.invalid with ESMTP id legacy-v1
+	for <operator@example.invalid>; Mon, 13 Jul 2026 12:00:01 +0000
+Received: from notifier.example.invalid (notifier.example.invalid [192.0.2.20])
+	by relay.example.invalid with ESMTP id legacy-origin;
+	Mon, 13 Jul 2026 12:00:00 +0000
+From: notifier@example.invalid
+Message-Id: <legacy-v1@example.invalid>
+To: operator@example.invalid
+Subject: Xserver mail notifier error
+Date: Mon, 13 Jul 2026 12:00:00 +0000
+X-Xserver-Mail-Notifier-Version: 1
+X-Xserver-Mail-Notifier-Type: error
+X-Xserver-Mail-Notifier-Event: 0123456789abcdef0123456789abcdef
+X-Xserver-Mail-Notifier-Body-SHA256: 749adcf5a0cb086d328dab809eddadcbb609ffb8d63f6b36e87f7fcf0aea0dea
+X-Xserver-Mail-Notifier-Auth: hmac-sha256=39b0d5900e65631f539aa7f6679b03fe23befb968daa943d36b9509b767dbacc
+
+Legacy delivery failure

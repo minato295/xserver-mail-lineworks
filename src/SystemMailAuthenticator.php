@@ -15,9 +15,21 @@ final class SystemMailAuthenticator
     private const MAX_MESSAGE_BYTES = 65_536;
 
     /** @var array<string,string> */
-    private const SUBJECTS = [
+    private const V1_SUBJECTS = [
         'error' => 'Xserver mail notifier error',
         'recovery' => 'Xserver mail notifier recovered',
+    ];
+
+    /** @var array<string,array{real:string,test:string}> */
+    private const V2_SUBJECTS = [
+        'error' => [
+            'real' => '【要確認】LINE WORKSメール通知で障害が発生しました',
+            'test' => '【テスト・対応不要】障害通知メールの動作確認',
+        ],
+        'recovery' => [
+            'real' => '【復旧・要確認】LINE WORKSメール通知が復旧しました',
+            'test' => '【テスト・対応不要】復旧通知メールの動作確認',
+        ],
     ];
 
     /** @var list<string> */
@@ -32,6 +44,13 @@ final class SystemMailAuthenticator
         'x-xserver-mail-notifier-auth',
     ];
 
+    /** @var array<string,string> */
+    private const V2_MIME_HEADERS = [
+        'mime-version' => '1.0',
+        'content-type' => 'text/plain; charset=UTF-8',
+        'content-transfer-encoding' => 'base64',
+    ];
+
     public function __construct(private readonly string $key)
     {
         if (strlen($key) !== 32) {
@@ -40,29 +59,43 @@ final class SystemMailAuthenticator
     }
 
     /** @param list<string> $recipients */
-    public function build(string $type, array $recipients, string $date, string $eventId, string $body): string
-    {
+    public function build(
+        string $type,
+        array $recipients,
+        string $date,
+        string $eventId,
+        string $body,
+        bool $test = false,
+    ): string {
         try {
             $to = implode(',', CanonicalEmail::many($recipients, false));
         } catch (InvalidArgumentException) {
             throw new InvalidArgumentException('Invalid system mail input');
         }
-        if (!isset(self::SUBJECTS[$type])
+        if (!isset(self::V2_SUBJECTS[$type])
             || preg_match('/\A[0-9a-f]{32}\z/D', $eventId) !== 1
-            || !$this->validDate($date)
-            || !$this->validUtf8($body)) {
+            || !$this->validV2Date($date)
+            || !$this->validV2Body($body)) {
             throw new InvalidArgumentException('Invalid system mail input');
         }
 
-        $normalizedBody = $this->normalizeBody($body);
-        $bodyHash = hash('sha256', $normalizedBody, false);
-        $subject = self::SUBJECTS[$type];
-        $hmac = $this->hmac(['1', $type, $eventId, $to, $subject, $date, $bodyHash]);
+        $subject = $this->encodeSubject(self::V2_SUBJECTS[$type][$test ? 'test' : 'real']);
+        $bodyHash = hash('sha256', $body, false);
+        $hmac = $this->hmac([
+            '2', $type, $eventId, $to, $subject, $date,
+            self::V2_MIME_HEADERS['mime-version'],
+            self::V2_MIME_HEADERS['content-type'],
+            self::V2_MIME_HEADERS['content-transfer-encoding'],
+            $bodyHash,
+        ]);
         $lines = [
             'To: ' . $to,
             'Subject: ' . $subject,
             'Date: ' . $date,
-            'X-Xserver-Mail-Notifier-Version: 1',
+            'MIME-Version: ' . self::V2_MIME_HEADERS['mime-version'],
+            'Content-Type: ' . self::V2_MIME_HEADERS['content-type'],
+            'Content-Transfer-Encoding: ' . self::V2_MIME_HEADERS['content-transfer-encoding'],
+            'X-Xserver-Mail-Notifier-Version: 2',
             'X-Xserver-Mail-Notifier-Type: ' . $type,
             'X-Xserver-Mail-Notifier-Event: ' . $eventId,
             'X-Xserver-Mail-Notifier-Body-SHA256: ' . $bodyHash,
@@ -73,8 +106,7 @@ final class SystemMailAuthenticator
                 throw new InvalidArgumentException('Invalid system mail input');
             }
         }
-        $wire = implode("\r\n", $lines) . "\r\n\r\n"
-            . str_replace("\n", "\r\n", $normalizedBody);
+        $wire = implode("\r\n", $lines) . "\r\n\r\n" . $this->canonicalBase64($body);
         if (strlen($wire) > self::MAX_MESSAGE_BYTES) {
             throw new InvalidArgumentException('Invalid system mail input');
         }
@@ -84,11 +116,10 @@ final class SystemMailAuthenticator
     public function isAuthentic(string $raw): bool
     {
         $boundary = $this->headerBoundary($raw);
-        if ($boundary === null || !$this->validUtf8(substr($raw, $boundary['bodyOffset']))) {
+        if ($boundary === null) {
             return false;
         }
-        $headerBytes = substr($raw, 0, $boundary['headerLength']);
-        $headers = $this->parseHeaders($headerBytes);
+        $headers = $this->parseHeaders(substr($raw, 0, $boundary['headerLength']));
         if ($headers === null) {
             return false;
         }
@@ -98,27 +129,89 @@ final class SystemMailAuthenticator
             }
         }
 
-        $version = $headers['x-xserver-mail-notifier-version'][0];
-        $type = $headers['x-xserver-mail-notifier-type'][0];
-        $event = $headers['x-xserver-mail-notifier-event'][0];
-        $to = $headers['to'][0];
-        $subject = $headers['subject'][0];
-        $date = $headers['date'][0];
-        $claimedBodyHash = $headers['x-xserver-mail-notifier-body-sha256'][0];
-        $claimedAuth = $headers['x-xserver-mail-notifier-auth'][0];
-        if ($version !== '1' || !isset(self::SUBJECTS[$type]) || $subject !== self::SUBJECTS[$type]
-            || preg_match('/\A[0-9a-f]{32}\z/D', $event) !== 1
-            || preg_match('/\A[0-9a-f]{64}\z/D', $claimedBodyHash) !== 1
-            || preg_match('/\Ahmac-sha256=([0-9a-f]{64})\z/D', $claimedAuth, $match) !== 1
-            || !$this->validDate($date) || !$this->canonicalTo($to)) {
+        $rawBody = substr($raw, $boundary['bodyOffset']);
+        return match ($headers['x-xserver-mail-notifier-version'][0]) {
+            '1' => $this->authenticateV1($headers, $rawBody),
+            '2' => $this->authenticateV2($headers, $rawBody),
+            default => false,
+        };
+    }
+
+    /** @param array<string,list<string>> $headers */
+    private function authenticateV1(array $headers, string $rawBody): bool
+    {
+        if (!$this->validUtf8($rawBody)) {
             return false;
         }
-        $bodyHash = hash('sha256', $this->normalizeBody(substr($raw, $boundary['bodyOffset'])), false);
+        $type = $headers['x-xserver-mail-notifier-type'][0];
+        $subject = $headers['subject'][0];
+        $date = $headers['date'][0];
+        if (!isset(self::V1_SUBJECTS[$type]) || $subject !== self::V1_SUBJECTS[$type]
+            || !$this->validV1Date($date) || !$this->validCommonValues($headers)) {
+            return false;
+        }
+
+        $bodyHash = hash('sha256', $this->normalizeV1Body($rawBody), false);
+        return $this->verifyHashAndHmac($headers, [
+            '1', $type, $headers['x-xserver-mail-notifier-event'][0], $headers['to'][0],
+            $subject, $date, $bodyHash,
+        ], $bodyHash);
+    }
+
+    /** @param array<string,list<string>> $headers */
+    private function authenticateV2(array $headers, string $rawBody): bool
+    {
+        foreach (self::V2_MIME_HEADERS as $name => $value) {
+            if (!isset($headers[$name]) || count($headers[$name]) !== 1 || $headers[$name][0] !== $value) {
+                return false;
+            }
+        }
+        $type = $headers['x-xserver-mail-notifier-type'][0];
+        $subject = $headers['subject'][0];
+        $date = $headers['date'][0];
+        if (!isset(self::V2_SUBJECTS[$type]) || !$this->validV2Subject($type, $subject)
+            || !$this->validV2Date($date) || !$this->validCommonValues($headers)) {
+            return false;
+        }
+
+        $flatBase64 = str_replace("\r\n", '', $rawBody);
+        $decodedBody = base64_decode($flatBase64, true);
+        if (!is_string($decodedBody) || !$this->validV2Body($decodedBody)
+            || $this->canonicalBase64($decodedBody) !== $rawBody) {
+            return false;
+        }
+        $bodyHash = hash('sha256', $decodedBody, false);
+        return $this->verifyHashAndHmac($headers, [
+            '2', $type, $headers['x-xserver-mail-notifier-event'][0], $headers['to'][0],
+            $subject, $date,
+            self::V2_MIME_HEADERS['mime-version'],
+            self::V2_MIME_HEADERS['content-type'],
+            self::V2_MIME_HEADERS['content-transfer-encoding'],
+            $bodyHash,
+        ], $bodyHash);
+    }
+
+    /** @param array<string,list<string>> $headers */
+    private function validCommonValues(array $headers): bool
+    {
+        return preg_match('/\A[0-9a-f]{32}\z/D', $headers['x-xserver-mail-notifier-event'][0]) === 1
+            && preg_match('/\A[0-9a-f]{64}\z/D', $headers['x-xserver-mail-notifier-body-sha256'][0]) === 1
+            && preg_match('/\Ahmac-sha256=[0-9a-f]{64}\z/D', $headers['x-xserver-mail-notifier-auth'][0]) === 1
+            && $this->canonicalTo($headers['to'][0]);
+    }
+
+    /**
+     * @param array<string,list<string>> $headers
+     * @param list<string> $fields
+     */
+    private function verifyHashAndHmac(array $headers, array $fields, string $bodyHash): bool
+    {
+        $claimedBodyHash = $headers['x-xserver-mail-notifier-body-sha256'][0];
         if (!hash_equals($claimedBodyHash, $bodyHash)) {
             return false;
         }
-        $expected = $this->hmac([$version, $type, $event, $to, $subject, $date, $bodyHash]);
-        return hash_equals($expected, $match[1]);
+        $claimedAuth = substr($headers['x-xserver-mail-notifier-auth'][0], strlen('hmac-sha256='));
+        return hash_equals($this->hmac($fields), $claimedAuth);
     }
 
     /** @return array{headerLength:int,bodyOffset:int}|null */
@@ -153,6 +246,9 @@ final class SystemMailAuthenticator
                 if ($previousName === null || in_array($previousName, self::REQUIRED_HEADERS, true)) {
                     return null;
                 }
+                if (isset(self::V2_MIME_HEADERS[$previousName])) {
+                    $headers[$previousName][] = "\0folded";
+                }
                 continue;
             }
             if (preg_match('/\A([!-9;-~]+):(.*)\z/D', $line, $match) !== 1) {
@@ -164,6 +260,12 @@ final class SystemMailAuthenticator
                     return null;
                 }
                 $match[2] = substr($match[2], 1);
+            } elseif (isset(self::V2_MIME_HEADERS[$name])) {
+                if (!str_starts_with($match[2], ' ')) {
+                    $match[2] = "\0invalid-syntax" . $match[2];
+                } else {
+                    $match[2] = substr($match[2], 1);
+                }
             }
             $headers[$name] ??= [];
             $headers[$name][] = $match[2];
@@ -185,7 +287,17 @@ final class SystemMailAuthenticator
         return implode(',', $canonical) === $to;
     }
 
-    private function validDate(string $date): bool
+    private function validV1Date(string $date): bool
+    {
+        return $this->validDateWithOffset($date, '+0000');
+    }
+
+    private function validV2Date(string $date): bool
+    {
+        return $this->validDateWithOffset($date, '+0900');
+    }
+
+    private function validDateWithOffset(string $date, string $offset): bool
     {
         if (preg_match('/[\x00-\x1f\x7f]/', $date) === 1) {
             return false;
@@ -196,7 +308,7 @@ final class SystemMailAuthenticator
             new DateTimeZone('UTC'),
         );
         return $parsed instanceof DateTimeImmutable && $parsed->format('D, d M Y H:i:s O') === $date
-            && str_ends_with($date, ' +0000');
+            && str_ends_with($date, ' ' . $offset);
     }
 
     private function validUtf8(string $value): bool
@@ -204,9 +316,50 @@ final class SystemMailAuthenticator
         return preg_match('//u', $value) === 1;
     }
 
-    private function normalizeBody(string $body): string
+    private function validV2Body(string $body): bool
+    {
+        return $this->validUtf8($body) && !str_contains($body, "\0") && !str_contains($body, "\r")
+            && str_ends_with($body, "\n") && !str_ends_with($body, "\n\n");
+    }
+
+    private function normalizeV1Body(string $body): string
     {
         return str_replace("\r", "\n", str_replace("\r\n", "\n", $body));
+    }
+
+    private function encodeSubject(string $subject): string
+    {
+        $points = preg_split('//u', $subject, -1, PREG_SPLIT_NO_EMPTY);
+        if (!is_array($points)) {
+            throw new InvalidArgumentException('Invalid system mail input');
+        }
+        $chunks = [];
+        $chunk = '';
+        foreach ($points as $point) {
+            if ($chunk !== '' && strlen($chunk . $point) > 45) {
+                $chunks[] = $chunk;
+                $chunk = '';
+            }
+            $chunk .= $point;
+        }
+        if ($chunk !== '') {
+            $chunks[] = $chunk;
+        }
+        return implode(' ', array_map(
+            static fn (string $value): string => '=?UTF-8?B?' . base64_encode($value) . '?=',
+            $chunks,
+        ));
+    }
+
+    private function validV2Subject(string $type, string $subject): bool
+    {
+        return $subject === $this->encodeSubject(self::V2_SUBJECTS[$type]['real'])
+            || $subject === $this->encodeSubject(self::V2_SUBJECTS[$type]['test']);
+    }
+
+    private function canonicalBase64(string $body): string
+    {
+        return rtrim(chunk_split(base64_encode($body), 76, "\r\n"), "\r\n") . "\r\n";
     }
 
     /** @param list<string> $fields */
