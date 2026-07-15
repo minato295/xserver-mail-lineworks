@@ -333,7 +333,8 @@ foreach ([0, -1, 31] as $invalidSoftCap) {
         NotifierConfig::fromArray([
             'webhook_url' => 'https://webhook.worksmobile.com/message/test',
             'error_recipients' => ['operator@example.invalid'],
-            'notification_pinned_targets' => [], 'notification_targets' => [],
+            'notification_pinned_targets' => [],
+            'notification_targets' => ['target@example.invalid'],
             'system_mail_hmac_key' => $configKey,
             'log_path' => '/tmp/notifier.log',
             'soft_cap_bytes' => $invalidSoftCap,
@@ -515,8 +516,9 @@ $testToken = str_repeat('a', 32);
 $armedConfig = NotifierConfig::fromArray([
     'webhook_url' => 'https://webhook.worksmobile.com/message/test',
     'error_recipients' => ['operator@example.invalid'],
-            'notification_pinned_targets' => [], 'notification_targets' => [],
-            'system_mail_hmac_key' => $configKey,
+    'notification_pinned_targets' => [],
+    'notification_targets' => ['target@example.invalid'],
+    'system_mail_hmac_key' => $configKey,
     'log_path' => '/tmp/notifier.log',
     'dedup_path' => '/tmp/notifier-dedup.json',
     'test_force_webhook_failure_until' => '2099-01-01T00:00:00+00:00',
@@ -535,6 +537,149 @@ foreach (['/home/example/public_html/config.json', '/home/example/PUBLIC_HTML/co
         // Expected.
     }
 }
+
+$recipientGateDirectory = sys_get_temp_dir() . '/recipient-gate-' . bin2hex(random_bytes(8));
+mkdir($recipientGateDirectory, 0700);
+$recipientGateLog = $recipientGateDirectory . '/delivery.log';
+$recipientGateDedupPath = $recipientGateDirectory . '/claims.json';
+$recipientGateConfig = NotifierConfig::fromArray([
+    'webhook_url' => 'https://webhook.worksmobile.com/message/test',
+    'error_recipients' => ['operator@example.invalid'],
+    'notification_pinned_targets' => ['info@example.invalid'],
+    'notification_targets' => [
+        'alerts@example.invalid',
+        'forwarding@example.invalid',
+        'info@example.invalid',
+    ],
+    'system_mail_hmac_key' => $configKey,
+    'log_path' => $recipientGateLog,
+    'dedup_path' => $recipientGateDedupPath,
+]);
+$recipientGateRequests = [];
+$recipientGateErrorRequests = [];
+$recipientGateLogger = new OperationalLogger($recipientGateLog);
+$recipientGateApplication = new DeliveryApplication(
+    new WebhookClient(
+        'https://webhook.worksmobile.com/message/test',
+        static function () use (&$recipientGateRequests): array {
+            $recipientGateRequests[] = true;
+            return response(200, 'success');
+        },
+    ),
+    new ErrorReporter(
+        new WebhookClient(
+            'https://webhook.worksmobile.com/message/error-test',
+            static function () use (&$recipientGateErrorRequests): array {
+                $recipientGateErrorRequests[] = true;
+                return response(500, 'server error');
+            },
+        ),
+        $recipientGateLogger,
+    ),
+    $recipientGateLogger,
+    $recipientGateConfig,
+    new DeliveryDeduplicator($recipientGateDedupPath),
+);
+
+$recipientGateCase = static function (
+    string $headers,
+    bool $expectedDelivery,
+    string $label,
+    string $body = 'Body',
+) use (&$recipientGateRequests, &$recipientGateErrorRequests, $recipientGateApplication): void {
+    static $messageNumber = 0;
+    ++$messageNumber;
+    $before = count($recipientGateRequests);
+    $raw = "From: sender@example.invalid\r\n"
+        . $headers . "\r\n"
+        . 'Message-ID: <recipient-matrix-' . $messageNumber . "@example.invalid>\r\n"
+        . "Subject: Recipient matrix\r\n\r\n" . $body;
+    $recipientGateApplication->deliver($raw);
+    deliveryCheck(count($recipientGateRequests) - $before === ($expectedDelivery ? 1 : 0), $label);
+    deliveryCheck($recipientGateErrorRequests === [], $label . ' must not create an incident');
+};
+
+foreach ($recipientGateConfig->notificationTargets as $target) {
+    $recipientGateCase('To: ' . $target, true, 'Each configured direct To target must deliver once');
+}
+$recipientGateCase("To: employee@example.invalid\r\nCc: info@example.invalid", true,
+    'Configured Cc with another To must deliver once');
+$recipientGateCase('To: "日本語表示名" <info@example.invalid>', true,
+    'Display-name target must deliver once');
+$recipientGateCase("To: employee@example.invalid\r\nCc: employee2@example.invalid,\r\n info@example.invalid", true,
+    'Folded Cc target must deliver once');
+$recipientGateCase('To: Team: employee@example.invalid, info@example.invalid;', true,
+    'Group address target must deliver once');
+$recipientGateCase('To: INFO@EXAMPLE.INVALID', true,
+    'Case-only target difference must deliver once');
+$recipientGateCase("To: info@example.invalid\r\nCc: alerts@example.invalid", true,
+    'Multiple matching visible recipients must still deliver once');
+
+foreach ([
+    "To: employee@example.invalid\r\nReply-To: info@example.invalid" => 'Reply-To-only target must not deliver',
+    "To: employee@example.invalid\r\nBcc: info@example.invalid" => 'Bcc-only target must not deliver',
+    "To: employee@example.invalid\r\nDelivered-To: info@example.invalid" => 'Delivered-To-only target must not deliver',
+    "To: employee@example.invalid\r\nX-Original-To: info@example.invalid" => 'X-Original-To-only target must not deliver',
+    "To: employee@example.invalid\r\nReturn-Path: <info@example.invalid>" => 'Return-Path-only target must not deliver',
+    "To: employee@example.invalid\r\nReceived: from info@example.invalid by mx.example.invalid" => 'Received-only target must not deliver',
+    "To: employee@example.invalid\r\nReceived: from mx.example.invalid (mx.example.invalid [192.0.2.1])\r\n by inbound.example.invalid with ESMTPS id abc123\r\n for <info@example.invalid>; Wed, 15 Jul 2026 12:34:56 +0900" => 'Complete Received trace target must not deliver',
+    'From: info@example.invalid' => 'From-only target must not deliver',
+    'To: prefixinfo@example.invalid' => 'Partial address match must not deliver',
+    'To: employee@example.invalid (info@example.invalid)' => 'Comment-only address text must not deliver',
+] as $headers => $label) {
+    $recipientGateCase($headers, false, $label);
+}
+$recipientGateCase("To: employee@example.invalid\r\nSubject: info@example.invalid", false,
+    'Subject-only target must not deliver');
+$recipientGateCase('To: employee@example.invalid', false,
+    'Body-only target must not deliver', 'Body contains info@example.invalid only');
+
+$recipientGateEvents = array_values(array_filter(explode("\n", (string) file_get_contents($recipientGateLog))));
+$ignoredEvents = array_values(array_filter($recipientGateEvents, static function (string $line): bool {
+    $event = json_decode($line, true, 512, JSON_THROW_ON_ERROR);
+    return $event['outcome'] === 'ignored' && $event['classification'] === 'non_target_recipient';
+}));
+deliveryCheck(count($ignoredEvents) === 12, 'Every normal non-target case must create one ignored event');
+foreach ($ignoredEvents as $line) {
+    deliveryCheck(!str_contains($line, '@') && !str_contains($line, 'Recipient matrix')
+        && !str_contains($line, 'Body contains'),
+        'Ignored logs must contain metadata only, never addresses, subjects, or bodies');
+}
+
+$ignoredLogFailureRequests = [];
+$ignoredLogFailureErrorRequests = [];
+$ignoredLogFailureDedupPath = $recipientGateDirectory . '/ignored-log-failure.json';
+$ignoredLogFailureLogger = new OperationalLogger($recipientGateDirectory . '/missing/delivery.log');
+(new DeliveryApplication(
+    new WebhookClient(
+        'https://webhook.worksmobile.com/message/test',
+        static function () use (&$ignoredLogFailureRequests): array {
+            $ignoredLogFailureRequests[] = true;
+            return response(200, 'success');
+        },
+    ),
+    new ErrorReporter(
+        new WebhookClient(
+            'https://webhook.worksmobile.com/message/error-test',
+            static function () use (&$ignoredLogFailureErrorRequests): array {
+                $ignoredLogFailureErrorRequests[] = true;
+                return response(500, 'server error');
+            },
+        ),
+        $ignoredLogFailureLogger,
+    ),
+    $ignoredLogFailureLogger,
+    $recipientGateConfig,
+    new DeliveryDeduplicator($ignoredLogFailureDedupPath),
+))->deliver("From: sender@example.invalid\r\nTo: employee@example.invalid\r\nMessage-ID: <ignored-log-failure@example.invalid>\r\n\r\nBody");
+deliveryCheck($ignoredLogFailureRequests === [] && $ignoredLogFailureErrorRequests === [],
+    'Ignored-log failure must not deliver or create an incident');
+deliveryCheck(!file_exists($ignoredLogFailureDedupPath),
+    'Ignored-log failure must not reserve deduplication state');
+
+foreach (glob($recipientGateDirectory . '/*') ?: [] as $file) { if (is_file($file)) unlink($file); }
+foreach (glob($recipientGateDirectory . '/.*') ?: [] as $file) { if (is_file($file)) unlink($file); }
+rmdir($recipientGateDirectory);
 
 $appRequests = [];
 $appWebhook = new WebhookClient(

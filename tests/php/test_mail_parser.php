@@ -30,6 +30,27 @@ function fixture(string $name): string
 $fallback = new DateTimeImmutable('2026-07-11T00:00:00+09:00');
 $parser = new MailParser();
 
+$recipientRaw = implode("\r\n", [
+    'From: sender@example.invalid',
+    'To: Employee <employee@example.invalid>',
+    'To: Team: first@example.invalid, Second <second@example.invalid>;',
+    'Cc: =?UTF-8?B?5pel5pys6Kqe?= <INFO@EXAMPLE.INVALID>,',
+    ' folded@example.invalid',
+    'Bcc: hidden@example.invalid',
+    'Reply-To: reply@example.invalid',
+    'Delivered-To: delivered@example.invalid',
+    'Subject: recipients',
+    '',
+    'Body mentions body@example.invalid',
+]);
+$recipients = $parser->parse($recipientRaw, $fallback)->visibleRecipientAddresses;
+check($recipients === [
+    'employee@example.invalid', 'first@example.invalid',
+    'second@example.invalid', 'INFO@EXAMPLE.INVALID', 'folded@example.invalid',
+], 'Only every structured To/Cc address must be retained in header order');
+check(!in_array('hidden@example.invalid', $recipients, true), 'Bcc must not be a visible recipient');
+check(!in_array('reply@example.invalid', $recipients, true), 'Reply-To must not be a visible recipient');
+
 check(QuoteTrimmer::plainText("新規\n> 引用\n続き") === "新規\n続き", 'Inline quote lines must be removed without hiding later new text');
 check(QuoteTrimmer::plainText("新規\nOn Mon, Jul 13, 2026 at 10:00 AM Sender <sender@example.invalid> wrote:\n過去本文") === '新規', 'Strict English reply boundary must hide the following quote');
 check(QuoteTrimmer::plainText("新規\n2026年7月13日(月) 10:00 送信者 <sender@example.invalid>:\n過去本文") === '新規', 'Dated Japanese reply boundary must hide the following quote');

@@ -16,6 +16,7 @@ final class OperationalLogger
         'invalid_webhook_url', 'rate_limited', 'http_error', 'transport_error',
         'forced_test_failure', 'internal_error', 'system_mail_suppressed',
         'health_state_failure', 'unknown', 'dedup_store_failure',
+        'non_target_recipient',
     ];
 
     private readonly Closure $utcClock;

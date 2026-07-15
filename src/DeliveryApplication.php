@@ -61,6 +61,14 @@ final class DeliveryApplication
                 throw new RuntimeException('Invalid parser result');
             }
             $messageIdHash = $this->deduplicationKey($message, $raw);
+            if ($this->config !== null && !$this->isNotificationTarget($message)) {
+                try {
+                    $this->logger->log('ignored', $messageIdHash, 'non_target_recipient', null);
+                } catch (Throwable) {
+                    // Recording a normal exclusion must not trigger an incident.
+                }
+                return;
+            }
             if ($this->deduplicator !== null) {
                 try {
                     $reservation = $this->deduplicator->reserve($messageIdHash);
@@ -117,6 +125,20 @@ final class DeliveryApplication
             return $message->messageIdHash;
         }
         return hash('sha256', $raw);
+    }
+
+    private function isNotificationTarget(MailMessage $message): bool
+    {
+        $targets = array_fill_keys(
+            array_map(static fn (string $value): string => strtolower($value), $this->config?->notificationTargets ?? []),
+            true,
+        );
+        foreach ($message->visibleRecipientAddresses as $address) {
+            if (isset($targets[strtolower($address)])) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private function commitReservation(string $hash, ?string &$token): void

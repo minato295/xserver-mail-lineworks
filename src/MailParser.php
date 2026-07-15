@@ -7,6 +7,7 @@ namespace XserverMail;
 use DateTimeImmutable;
 use DateTimeZone;
 use InvalidArgumentException;
+use ZBateson\MailMimeParser\Header\AddressHeader;
 use ZBateson\MailMimeParser\Header\DateHeader;
 use ZBateson\MailMimeParser\MailMimeParser;
 use ZBateson\MailMimeParser\Message\PartFilter;
@@ -52,6 +53,18 @@ final class MailParser
             );
         }
 
+        $visibleRecipientAddresses = [];
+        foreach (['To', 'Cc'] as $name) {
+            foreach ($message->getAllHeadersByName($name) as $addressHeader) {
+                if (!$addressHeader instanceof AddressHeader) {
+                    continue;
+                }
+                foreach ($addressHeader->getAddresses() as $address) {
+                    $visibleRecipientAddresses[] = $address->getEmail();
+                }
+            }
+        }
+
         return new MailMessage(
             $receivedAt,
             $header('From'),
@@ -63,6 +76,7 @@ final class MailParser
             $notificationBody,
             hash('sha256', $header('Message-ID')),
             $attachments,
+            $visibleRecipientAddresses,
         );
     }
 
