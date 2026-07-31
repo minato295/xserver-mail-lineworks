@@ -19,14 +19,25 @@ final class OperationalLogger
         'health_state_failure', 'unknown', 'dedup_store_failure',
         'non_target_recipient',
     ];
+    private const RESPONSE_FORMATS = ['json', 'invalid_json', 'transport_error'];
 
     private readonly Closure $utcClock;
+    private readonly Closure $effectiveUid;
 
-    public function __construct(private readonly string $path, ?callable $utcClock = null)
-    {
+    public function __construct(
+        private readonly string $path,
+        ?callable $utcClock = null,
+        ?callable $effectiveUid = null,
+    ) {
         $this->utcClock = Closure::fromCallable(
             $utcClock ?? static fn (): DateTimeImmutable => new DateTimeImmutable('now', new DateTimeZone('UTC')),
         );
+        $this->effectiveUid = Closure::fromCallable($effectiveUid ?? static function (): int {
+            if (!function_exists('posix_geteuid')) {
+                throw new RuntimeException('Operational log unavailable');
+            }
+            return posix_geteuid();
+        });
     }
 
     public function log(
@@ -52,6 +63,9 @@ final class OperationalLogger
         ];
         if ($diagnostic !== null) {
             $lastRelevant = $this->lastRelevantAttempt($diagnostic, $outcome);
+            if (!in_array($lastRelevant->responseFormat, self::RESPONSE_FORMATS, true)) {
+                throw new RuntimeException('Operational log unavailable');
+            }
             $event += [
                 'attempt_count' => count($diagnostic->attempts),
                 'attempt_http_statuses' => $diagnostic->attemptHttpStatuses(),
@@ -124,10 +138,10 @@ final class OperationalLogger
         $fileHandle = null;
         try {
             NotifierConfig::assertPrivatePath($this->path);
-            if (!function_exists('posix_geteuid')) {
+            $owner = ($this->effectiveUid)();
+            if (!is_int($owner) || $owner < 0) {
                 throw new RuntimeException('Operational log unavailable');
             }
-            $owner = posix_geteuid();
             $directory = dirname($this->path);
             $resolvedDirectory = realpath($directory);
             if (!is_string($resolvedDirectory) || is_link($directory)) {

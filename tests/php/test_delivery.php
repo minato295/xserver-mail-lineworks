@@ -17,6 +17,7 @@ use XserverMail\SendmailProcessAdapter;
 use XserverMail\SendmailProcessHandle;
 use XserverMail\SystemMailAuthenticator;
 use XserverMail\WebhookClient;
+use XserverMail\WebhookAttemptDiagnostic;
 use XserverMail\WebhookDiagnostic;
 use XserverMail\StdinFrame;
 
@@ -450,12 +451,26 @@ deliveryCheck(array_keys($events[0]) === [
     'timestamp', 'outcome', 'message_id_hash', 'classification', 'http_status',
 ], 'Diagnostic-free logs must preserve the legacy five-field schema');
 $event = $events[1];
-deliveryCheck($event['attempt_count'] === 2, 'Log must record bounded attempt count');
-deliveryCheck($event['attempt_http_statuses'] === [500, 200], 'Log must record status history');
-deliveryCheck($event['provider_code'] === 'E500', 'Log must record safe provider code');
-deliveryCheck($event['provider_description'] === 'temporary failure', 'Log must record safe provider description');
-deliveryCheck($event['response_format'] === 'json', 'Log must record response format');
-deliveryCheck($event['recovered_by_retry'] === true, 'Log must identify retry recovery');
+deliveryCheck(array_keys($event) === [
+    'timestamp', 'outcome', 'message_id_hash', 'classification', 'http_status',
+    'attempt_count', 'attempt_http_statuses', 'provider_code', 'provider_description',
+    'response_format', 'response_content_type', 'response_body_bytes', 'response_body_sha256',
+    'payload_bytes', 'title_characters', 'text_characters', 'recovered_by_retry',
+], 'Diagnostic logs must contain exactly the allowlisted fields');
+deliveryCheck(array_slice($event, 5, null, true) === [
+    'attempt_count' => 2,
+    'attempt_http_statuses' => [500, 200],
+    'provider_code' => 'E500',
+    'provider_description' => 'temporary failure',
+    'response_format' => 'json',
+    'response_content_type' => 'application/json; charset=UTF-8',
+    'response_body_bytes' => 55,
+    'response_body_sha256' => 'e75177c2c53517db46aa9c0e13571a1e9f5b28f867e398822e43201983c49ab3',
+    'payload_bytes' => 43,
+    'title_characters' => 2,
+    'text_characters' => 2,
+    'recovered_by_retry' => true,
+], 'Diagnostic logs must preserve every approved value from the last failed attempt');
 deliveryCheck(($events[2]['attempt_http_statuses'] ?? null) === [500, 200]
     && ($events[2]['provider_code'] ?? null) === 'E500',
     'DeliveryApplication must pass webhook diagnostics to the operational log');
@@ -472,6 +487,75 @@ foreach ([
         'Operational diagnostics must omit mail, webhook, exception, and raw response secrets');
 }
 deliveryCheck((fileperms($logPath) & 0777) === 0600, 'New operational log must be mode 0600');
+
+$loggerBoundaryPath = $logDirectory . '/diagnostic-boundaries.jsonl';
+$loggerBoundary = new OperationalLogger($loggerBoundaryPath);
+$loggerBoundaryCases = [
+    ['code-64', str_repeat('c', 64), 'description', 'text/plain', str_repeat('c', 64), 'description', 'text/plain'],
+    ['code-65', str_repeat('c', 65), 'description', 'text/plain', str_repeat('c', 64), 'description', 'text/plain'],
+    ['description-200', 'code', str_repeat('d', 200), 'text/plain', 'code', str_repeat('d', 200), 'text/plain'],
+    ['description-201', 'code', str_repeat('d', 201), 'text/plain', 'code', str_repeat('d', 200), 'text/plain'],
+    ['content-type-100', 'code', 'description', str_repeat('t', 100), 'code', 'description', str_repeat('t', 100)],
+    ['content-type-101', 'code', 'description', str_repeat('t', 101), 'code', 'description', str_repeat('t', 100)],
+];
+foreach ($loggerBoundaryCases as [$label, $code, $description, $contentType]) {
+    $loggerBoundary->log('failure', str_repeat('6', 64), 'http_error', 400, new WebhookDiagnostic(
+        [new WebhookAttemptDiagnostic(
+            400, $code, $description, 'json', $contentType, 2,
+            'd4735e3a265e16eee03f59718b9b5d03019c07d8b6c51f90da3a666eec13ab35',
+        )],
+        10, 3, 4, false,
+    ));
+}
+$loggerBoundaryEvents = array_map(
+    static fn (string $line): array => json_decode($line, true, 16, JSON_THROW_ON_ERROR),
+    array_values(array_filter(explode("\n", (string) file_get_contents($loggerBoundaryPath)))),
+);
+foreach ($loggerBoundaryCases as $index => [$label, , , , $expectedCode, $expectedDescription, $expectedContentType]) {
+    deliveryCheck(($loggerBoundaryEvents[$index]['provider_code'] ?? null) === $expectedCode,
+        $label . ' must be re-bounded by OperationalLogger');
+    deliveryCheck(($loggerBoundaryEvents[$index]['provider_description'] ?? null) === $expectedDescription,
+        $label . ' description must be re-bounded by OperationalLogger');
+    deliveryCheck(($loggerBoundaryEvents[$index]['response_content_type'] ?? null) === $expectedContentType,
+        $label . ' content type must be re-bounded by OperationalLogger');
+}
+
+$beforeInvalidFormat = (string) file_get_contents($loggerBoundaryPath);
+$invalidFormatDiagnostic = new WebhookDiagnostic(
+    [new WebhookAttemptDiagnostic(
+        400, 'E400', 'invalid parameter', 'xml', 'application/xml', 20,
+        'f5a45a5bb456a9ec2a298f9b7b22c08ec7e8c92a9b7c38b5116f8f396399020a',
+    )],
+    10, 3, 4, false,
+);
+try {
+    $loggerBoundary->log('failure', str_repeat('7', 64), 'http_error', 400, $invalidFormatDiagnostic);
+    throw new RuntimeException('Unapproved response format was accepted');
+} catch (RuntimeException $exception) {
+    deliveryCheck($exception->getMessage() !== 'Unapproved response format was accepted',
+        'OperationalLogger must reject response formats outside its allowlist');
+}
+deliveryCheck((string) file_get_contents($loggerBoundaryPath) === $beforeInvalidFormat,
+    'Rejected response format must not append any part of an event');
+
+$wrongOwnerPath = $logDirectory . '/wrong-owner.jsonl';
+file_put_contents($wrongOwnerPath, "UNCHANGED_WRONG_OWNER\n");
+chmod($wrongOwnerPath, 0600);
+$wrongOwnerLogger = new OperationalLogger(
+    $wrongOwnerPath,
+    null,
+    static fn (): int => posix_geteuid() + 1,
+);
+try {
+    $wrongOwnerLogger->log('success', str_repeat('8', 64), 'success', 200);
+    throw new RuntimeException('Wrong-owner operational log was accepted');
+} catch (RuntimeException $exception) {
+    deliveryCheck($exception->getMessage() !== 'Wrong-owner operational log was accepted',
+        'OperationalLogger must compare stat ownership with the effective UID resolver');
+}
+deliveryCheck((string) file_get_contents($wrongOwnerPath) === "UNCHANGED_WRONG_OWNER\n"
+    && (fileperms($wrongOwnerPath) & 0777) === 0600,
+    'Rejected wrong-owner log must not be modified or chmodded');
 
 $badModePath = $logDirectory . '/bad-mode.jsonl';
 file_put_contents($badModePath, "UNCHANGED_BAD_MODE\n");
@@ -530,6 +614,8 @@ try {
 deliveryCheck(!file_exists($publicLogPath), 'Rejected public path must not receive a log file');
 
 unlink($logPath);
+unlink($loggerBoundaryPath);
+unlink($wrongOwnerPath);
 unlink($badModePath);
 unlink($symlinkPath);
 unlink($outsideTarget);
