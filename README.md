@@ -113,6 +113,42 @@ Webhook成功時はエラーメールを送りません。通常Webhookの失敗
 
 ## 障害対応
 
+### Webhook障害を同期診断で確認する
+
+1. Macアプリを開き、メニューの「9. 同期診断」を選びます。この操作は最新の失敗、または再試行で復旧したWebhook送信を「Webhook診断」として表示します。
+2. 表示された日時、結果、HTTP推移、コード、説明、応答形式、再試行結果、ID先頭12文字を確認します。HTTP推移は送信順で、`500 → 200` は初回のHTTP 500後に再送が成功、`500 → 500` は再送後も失敗、`接続失敗` はHTTP状態を取得できなかったことを表します。結果と再試行が「復旧」の場合、コード・説明・応答メタデータには、成功した最終応答ではなく直前の失敗応答が表示されます。IDはメール識別ハッシュの先頭12文字であり、同じメールの記録を照合するための値です。メールアドレスやMessage-IDそのものではありません。
+3. 応答形式の `json` はLINE WORKS応答をJSONとして検証できたこと、`invalid_json` はJSONとして検証できない応答だったこと、`transport_error` はHTTP応答を取得できなかったことを表します。`invalid_json`でも応答本文の原文は保存されず、サイズとSHA-256だけが記録されます。
+4. HTTP 5xxが再試行でも継続した場合は、表示された日時、コード、説明、応答形式、再試行結果、ID先頭12文字を添えてLINE WORKSへ問い合わせます。メール内容、Webhook URL、認証情報、応答本文、64文字のID全体は問い合わせへ転記しません。
+5. `transport_error` の場合は、XserverからLINE WORKSへの外向き通信について、DNS名前解決、TLS証明書検証、接続、タイムアウトの順に調査します。HTTP状態を取得できていないため、LINE WORKSがHTTPエラーを返したと断定しません。
+
+診断ログは公開領域外の `/home/s3710/mail-lineworks/private/log/mail-notifier.jsonl` にJSON Lines形式で保存します。ログファイルは所有者だけが読み書きできる `0600`、親ディレクトリは所有者だけがアクセスできる `0700` でなければなりません。サーバーは通常ファイル・所有者・権限を検証し、Mac管理CLIも認証済みFTPS接続でprivate領域とファイルの `0600` を確認してから読み取ります。権限、所有者、ファイル種別または保存場所が不正な場合、診断ログの書込み・表示は安全側に停止しますが、メール受信処理はfail-openを維持します。
+
+ログへ保存するのは、既存の `timestamp`、`outcome`、`message_id_hash`、`classification`、`http_status` と、次の許可済み診断項目だけです。
+
+- `attempt_count`: Webhook送信回数
+- `attempt_http_statuses`: 各試行のHTTP状態（取得不能時は `null`）
+- `provider_code`: JSON応答のコード
+- `provider_description`: 制御文字を除去し長さを制限したJSON応答の説明
+- `response_format`: `json`、`invalid_json`、`transport_error` の区別
+- `response_content_type`: 長さを制限した応答Content-Type
+- `response_body_bytes`: 応答本文のバイト数
+- `response_body_sha256`: 応答本文のSHA-256
+- `payload_bytes`: 送信JSONのバイト数
+- `title_characters`: 通知タイトルの文字数
+- `text_characters`: 通知本文の文字数
+- `recovered_by_retry`: 初回失敗後の再試行で復旧したか
+
+次の情報は診断ログへ保存しません。
+
+- メール本文、通知本文、件名、差出人、To、Cc、Bcc
+- 添付ファイル名と添付内容
+- Webhook URL
+- Xserver APIキー、FTPS・SSH・メールの認証情報
+- LINE WORKS応答本文の原文
+- 例外メッセージ、HTTPリクエストヘッダー
+
+旧形式ログは引き続き読み取れますが、許可済み診断項目がない場合は「Webhook診断: 詳細診断情報なし」と表示します。ログが不正、過大、または安全な権限で読み取れない場合は「Webhook診断: 診断ログを安全に読み取れません」と表示します。
+
 1. メールボックスに原本があるか確認します。なければ通知ツールではなくXserver受信・振り分け設定を調べます。
 2. 管理CLIの「同期診断」で恒久対象のAPI登録数、APIと設定の対象件数、コマンドパス、リリース情報を比較し、配信状態が「未作成」「正常」「障害中」「状態ファイル不正」のどれかを確認します。診断は固定helperのredacted summaryだけを使い、アドレス、鍵、Message-ID hash、Webhook token、状態ファイルpathを表示しません。「状態ファイル不正」の場合は通知メールを再試行する前にprivate directory chain、owner、mode 600、JSON schemaを確認します。
 3. 公開領域外のJSON Linesログで `outcome`、`classification`、`http_status` を確認します。ログへ本文や秘密値を追加しないでください。
