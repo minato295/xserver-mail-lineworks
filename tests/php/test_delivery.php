@@ -392,31 +392,151 @@ $timeout = new WebhookClient(
 deliveryCheck(!$timeout->send('Title', str_repeat('x', 500))->isSuccess(), 'Transport timeout must fail safely');
 deliveryCheck($timeoutCalls === 1, 'Ambiguous timeout must not retry or split');
 
-$logPath = tempnam(sys_get_temp_dir(), 'delivery-log-');
-if ($logPath === false) {
-    throw new RuntimeException('Could not create test log');
-}
+$logDirectory = sys_get_temp_dir() . '/delivery-log-' . bin2hex(random_bytes(8));
+mkdir($logDirectory, 0700);
+$logDirectory = realpath($logDirectory);
+deliveryCheck(is_string($logDirectory), 'Operational log fixture directory must resolve');
+$logPath = $logDirectory . '/operational.jsonl';
 $logger = new OperationalLogger($logPath);
-$successfulReporter = new ErrorReporter(
-    new WebhookClient('https://webhook.worksmobile.com/message/test', static fn (): array => response(200, 'success')),
-    $logger,
+$logger->log('success', str_repeat('0', 64), 'success', 200);
+$logger->log(
+    'success', str_repeat('1', 64), 'success', 200, $diagnosticResult->diagnostic,
 );
-$successfulReporter->report(new RuntimeException('sensitive-value-placeholder'), str_repeat('a', 64));
 
-$failedReporter = new ErrorReporter(
-    new WebhookClient('https://webhook.worksmobile.com/message/test', static fn (): array => response(500, 'server error')),
+$applicationResponses = [
+    [
+        'status' => 500,
+        'body' => '{"code":"E500","description":"temporary failure","raw":"RESPONSE_BODY_MARKER"}',
+        'headers' => ['Content-Type' => 'application/json'],
+    ],
+    response(200, 'success'),
+];
+$applicationWebhook = new WebhookClient(
+    'https://webhook.worksmobile.com/message/WEBHOOK_TOKEN_MARKER',
+    static function () use (&$applicationResponses): array { return array_shift($applicationResponses); },
+    256,
+    static function (): void {},
+);
+$applicationReporter = new ErrorReporter($applicationWebhook, $logger);
+(new DeliveryApplication($applicationWebhook, $applicationReporter, $logger))->deliver(
+    "From: ADDRESS_MARKER@example.invalid\r\n"
+    . "To: receiver@example.invalid\r\n"
+    . "Subject: SUBJECT_MARKER\r\n"
+    . "Content-Type: multipart/mixed; boundary=x\r\n\r\n"
+    . "--x\r\nContent-Type: text/plain\r\n\r\nMAIL_BODY_MARKER\r\n"
+    . "--x\r\nContent-Disposition: attachment; filename=ATTACHMENT_MARKER.txt\r\n\r\nx\r\n--x--\r\n",
+);
+
+$reporter = new ErrorReporter(
+    new WebhookClient(
+        'https://webhook.worksmobile.com/message/REPORTER_WEBHOOK_TOKEN_MARKER',
+        static fn (): array => [
+            'status' => 400,
+            'body' => '{"code":"E400","description":"invalid parameter","raw":"REPORTER_RESPONSE_BODY_MARKER"}',
+            'headers' => ['Content-Type' => 'application/json'],
+        ],
+    ),
     $logger,
 );
-$failedReporter->report(new RuntimeException('token=secret-placeholder'), str_repeat('b', 64));
+$reporter->report(new RuntimeException('EXCEPTION_MESSAGE_MARKER'), str_repeat('b', 64));
 
 $logs = file_get_contents($logPath);
 deliveryCheck($logs !== false && $logs !== '', 'Operational events must be logged');
-deliveryCheck(!str_contains($logs, 'secret-placeholder') && !str_contains($logs, '/message/test'), 'Logs must never contain webhook URLs, exception messages, or secret values');
-foreach (array_filter(explode("\n", (string) $logs)) as $line) {
-    $event = json_decode($line, true, 512, JSON_THROW_ON_ERROR);
-    deliveryCheck(array_keys($event) === ['timestamp', 'outcome', 'message_id_hash', 'classification', 'http_status'], 'Logs must contain only the allowlisted fields');
+$events = array_map(
+    static fn (string $line): array => json_decode($line, true, 512, JSON_THROW_ON_ERROR),
+    array_values(array_filter(explode("\n", (string) $logs))),
+);
+deliveryCheck(array_keys($events[0]) === [
+    'timestamp', 'outcome', 'message_id_hash', 'classification', 'http_status',
+], 'Diagnostic-free logs must preserve the legacy five-field schema');
+$event = $events[1];
+deliveryCheck($event['attempt_count'] === 2, 'Log must record bounded attempt count');
+deliveryCheck($event['attempt_http_statuses'] === [500, 200], 'Log must record status history');
+deliveryCheck($event['provider_code'] === 'E500', 'Log must record safe provider code');
+deliveryCheck($event['provider_description'] === 'temporary failure', 'Log must record safe provider description');
+deliveryCheck($event['response_format'] === 'json', 'Log must record response format');
+deliveryCheck($event['recovered_by_retry'] === true, 'Log must identify retry recovery');
+deliveryCheck(($events[2]['attempt_http_statuses'] ?? null) === [500, 200]
+    && ($events[2]['provider_code'] ?? null) === 'E500',
+    'DeliveryApplication must pass webhook diagnostics to the operational log');
+deliveryCheck(($events[3]['attempt_http_statuses'] ?? null) === [400]
+    && ($events[3]['provider_code'] ?? null) === 'E400',
+    'ErrorReporter must pass error-webhook diagnostics to the operational log');
+foreach ([
+    'ADDRESS_MARKER@example.invalid', 'SUBJECT_MARKER', 'MAIL_BODY_MARKER', 'ATTACHMENT_MARKER.txt',
+    'WEBHOOK_TOKEN_MARKER', 'REPORTER_WEBHOOK_TOKEN_MARKER', 'EXCEPTION_MESSAGE_MARKER',
+    'RESPONSE_BODY_MARKER', 'REPORTER_RESPONSE_BODY_MARKER',
+    '{"code":"E500","description":"temporary failure"',
+] as $secret) {
+    deliveryCheck(!str_contains((string) $logs, $secret),
+        'Operational diagnostics must omit mail, webhook, exception, and raw response secrets');
 }
+deliveryCheck((fileperms($logPath) & 0777) === 0600, 'New operational log must be mode 0600');
+
+$badModePath = $logDirectory . '/bad-mode.jsonl';
+file_put_contents($badModePath, "UNCHANGED_BAD_MODE\n");
+chmod($badModePath, 0644);
+try {
+    (new OperationalLogger($badModePath))->log('success', str_repeat('2', 64), 'success', 200);
+    throw new RuntimeException('Mode-0644 operational log was accepted');
+} catch (RuntimeException $exception) {
+    deliveryCheck($exception->getMessage() !== 'Mode-0644 operational log was accepted',
+        'Existing mode-0644 operational log must be rejected');
+}
+deliveryCheck((string) file_get_contents($badModePath) === "UNCHANGED_BAD_MODE\n"
+    && (fileperms($badModePath) & 0777) === 0644,
+    'Rejected mode-0644 log must not be modified or chmodded');
+
+$outsideDirectory = sys_get_temp_dir() . '/delivery-log-target-' . bin2hex(random_bytes(8));
+mkdir($outsideDirectory, 0700);
+$outsideTarget = $outsideDirectory . '/outside.jsonl';
+file_put_contents($outsideTarget, "UNCHANGED_SYMLINK_TARGET\n");
+chmod($outsideTarget, 0600);
+$symlinkPath = $logDirectory . '/symlink.jsonl';
+symlink($outsideTarget, $symlinkPath);
+try {
+    (new OperationalLogger($symlinkPath))->log('success', str_repeat('3', 64), 'success', 200);
+    throw new RuntimeException('Symlink operational log was accepted');
+} catch (RuntimeException $exception) {
+    deliveryCheck($exception->getMessage() !== 'Symlink operational log was accepted',
+        'Symlink operational log must be rejected');
+}
+deliveryCheck((string) file_get_contents($outsideTarget) === "UNCHANGED_SYMLINK_TARGET\n"
+    && (fileperms($outsideTarget) & 0777) === 0600,
+    'Rejected symlink must not alter or chmod its external target');
+
+$openParent = $logDirectory . '/open-parent';
+mkdir($openParent, 0755);
+$openParentLog = $openParent . '/operational.jsonl';
+try {
+    (new OperationalLogger($openParentLog))->log('success', str_repeat('4', 64), 'success', 200);
+    throw new RuntimeException('Operational log below a non-0700 parent was accepted');
+} catch (RuntimeException $exception) {
+    deliveryCheck($exception->getMessage() !== 'Operational log below a non-0700 parent was accepted',
+        'Operational log parent must be mode 0700');
+}
+deliveryCheck(!file_exists($openParentLog), 'Rejected non-private parent must not receive a log file');
+
+$publicLogDirectory = $logDirectory . '/public_html';
+mkdir($publicLogDirectory, 0700);
+$publicLogPath = $publicLogDirectory . '/operational.jsonl';
+try {
+    (new OperationalLogger($publicLogPath))->log('success', str_repeat('5', 64), 'success', 200);
+    throw new RuntimeException('Operational log below public_html was accepted');
+} catch (RuntimeException $exception) {
+    deliveryCheck($exception->getMessage() !== 'Operational log below public_html was accepted',
+        'Operational log path must remain outside public_html');
+}
+deliveryCheck(!file_exists($publicLogPath), 'Rejected public path must not receive a log file');
+
 unlink($logPath);
+unlink($badModePath);
+unlink($symlinkPath);
+unlink($outsideTarget);
+rmdir($outsideDirectory);
+rmdir($openParent);
+rmdir($publicLogDirectory);
+rmdir($logDirectory);
 
 foreach ([0, -1, 31] as $invalidSoftCap) {
     try {
@@ -881,12 +1001,16 @@ $reportFailureWebhook = new WebhookClient(
     static function (): void { throw new RuntimeException('reporter sleeper failed'); },
 );
 $reportFailureReporter = new ErrorReporter($reportFailureWebhook, $brokenLogger);
-$reportFailureLog = tempnam(sys_get_temp_dir(), 'report-failure-log-');
-deliveryCheck(is_string($reportFailureLog), 'Reporter failure test log must be created');
+$reportFailureDirectory = sys_get_temp_dir() . '/report-failure-log-' . bin2hex(random_bytes(8));
+mkdir($reportFailureDirectory, 0700);
+$reportFailureLog = $reportFailureDirectory . '/operational.jsonl';
+file_put_contents($reportFailureLog, '');
+chmod($reportFailureLog, 0600);
 (new DeliveryApplication($reportFailureWebhook, $reportFailureReporter, new OperationalLogger($reportFailureLog)))
     ->deliver(file_get_contents(dirname(__DIR__) . '/fixtures/plain.eml') ?: '');
 deliveryCheck($reportFailureCalls === 2, 'Reporter failure must be swallowed without retrying the reporter');
 unlink($reportFailureLog);
+rmdir($reportFailureDirectory);
 
 $forcedRaw = "From: sender@example.invalid\r\nTo: target@example.invalid\r\nSubject: [Error Test {$testToken}]\r\nMessage-ID: <forced@example.invalid>\r\n\r\nSecret body";
 
