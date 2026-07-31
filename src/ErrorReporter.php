@@ -48,6 +48,7 @@ final class ErrorReporter
                 $messageIdHash,
                 $result->isSuccess() ? $classification : $result->classification,
                 $result->httpStatus,
+                $result->diagnostic,
             );
             return;
         }
@@ -56,17 +57,25 @@ final class ErrorReporter
             ? new WebhookResult(false, null, 'forced_test_failure')
             : $this->webhook->send('メール通知システムエラー', '処理に失敗しました。分類: ' . $classification);
         if ($result->isSuccess()) {
-            $this->safeLog('success', $messageIdHash, $classification, $result->httpStatus);
+            $this->safeLog('success', $messageIdHash, $classification, $result->httpStatus, $result->diagnostic);
             return;
         }
 
-        $this->safeLog('failure', $messageIdHash, $result->classification, $result->httpStatus);
+        $this->safeLog(
+            'failure', $messageIdHash, $result->classification, $result->httpStatus, $result->diagnostic,
+        );
     }
 
-    private function safeLog(string $outcome, string $hash, string $classification, ?int $status): void
+    private function safeLog(
+        string $outcome,
+        string $hash,
+        string $classification,
+        ?int $status,
+        ?WebhookDiagnostic $diagnostic = null,
+    ): void
     {
         try {
-            $this->logger->log($outcome, $hash, $classification, $status);
+            $this->logger->log($outcome, $hash, $classification, $status, $diagnostic);
         } catch (Throwable) {
             // Reporting must never break inbound mail delivery.
         }

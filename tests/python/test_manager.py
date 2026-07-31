@@ -121,11 +121,15 @@ class FakeApi:
 
 
 class FakeDeployer:
-    def __init__(self, config=None, read_error=None, read_configs=None):
+    def __init__(self, config=None, read_error=None, read_configs=None,
+                 log_body=b"", log_error=None):
         self.configs = []
         self.config = dict(config or {})
         self.read_error = read_error
         self.read_configs = iter(read_configs) if read_configs is not None else None
+        self.log_body = log_body
+        self.log_error = log_error
+        self.log_reads = []
 
     def read_private_config(self):
         if self.read_error:
@@ -137,6 +141,12 @@ class FakeDeployer:
     def update_private_config(self, config):
         self.configs.append(config)
         self.config = dict(config)
+
+    def read_private_log_tail(self, remote_path, *, limit, expected_mode="600"):
+        self.log_reads.append((remote_path, limit, expected_mode))
+        if self.log_error is not None:
+            raise self.log_error
+        return self.log_body
 
     @staticmethod
     def _digest(config):
@@ -237,6 +247,30 @@ def legacy_managed(filter_id, address):
     rule = managed(filter_id, address)
     rule["conditions"] = [{"field": "to", "match_type": "match", "keyword": address}]
     return rule
+
+
+def webhook_diagnostic_event(**overrides):
+    event = {
+        "timestamp": "2026-07-29T23:10:49+00:00",
+        "outcome": "failure",
+        "message_id_hash": "1" * 64,
+        "classification": "http_error",
+        "http_status": 500,
+        "attempt_count": 1,
+        "attempt_http_statuses": [500],
+        "provider_code": "E500",
+        "provider_description": "internal server error",
+        "response_format": "json",
+        "response_content_type": "application/json",
+        "response_body_bytes": 48,
+        "response_body_sha256": "2" * 64,
+        "payload_bytes": 512,
+        "title_characters": 12,
+        "text_characters": 250,
+        "recovered_by_retry": False,
+    }
+    event.update(overrides)
+    return event
 
 
 class ManagerTest(unittest.TestCase):
@@ -1582,12 +1616,14 @@ class ManagerTest(unittest.TestCase):
 
     def make_manager(self, answers=(), filters=(), errors=(), config=None, read_error=None,
                      now_fn=None, test_token_fn=None, read_configs=None,
-                     initial_command_path=None):
+                     initial_command_path=None, log_body=b"", log_error=None):
         output = []
         api = FakeApi(filters)
         if config is None and errors:
             config = {"error_recipients": list(errors)}
-        deployer = FakeDeployer(config, read_error, read_configs)
+        deployer = FakeDeployer(
+            config, read_error, read_configs, log_body=log_body, log_error=log_error
+        )
         answers = iter(answers)
         manager = MailManager(
             api,
@@ -1743,6 +1779,441 @@ class ManagerTest(unittest.TestCase):
                         "private-token", message_hash,
                         "/private/releases/private-release-id"):
             self.assertNotIn(private, rendered)
+
+    def test_diagnostics_display_latest_safe_webhook_failure(self):
+        log_path = "/home/example/mail-lineworks/private/log/mail-notifier.jsonl"
+        message_hash = "2ec3d48e5880d38a37b822b8e2fd8af1fc91070e97341b9776a19438264f672d"
+        response_hash = "f" * 64
+        failure = {
+            "timestamp": "2026-07-29T23:10:49+00:00",
+            "outcome": "failure",
+            "message_id_hash": message_hash,
+            "classification": "http_error",
+            "http_status": 500,
+            "attempt_count": 2,
+            "attempt_http_statuses": [500, 500],
+            "provider_code": "E500",
+            "provider_description": "internal server error",
+            "response_format": "json",
+            "response_content_type": "application/json; charset=UTF-8",
+            "response_body_bytes": 84,
+            "response_body_sha256": response_hash,
+            "payload_bytes": 512,
+            "title_characters": 12,
+            "text_characters": 250,
+            "recovered_by_retry": False,
+        }
+        later_legacy_success = {
+            "timestamp": "2026-07-29T23:11:00+00:00",
+            "outcome": "success",
+            "message_id_hash": "a" * 64,
+            "classification": "success",
+            "http_status": 200,
+        }
+        log_body = (json.dumps(failure, ensure_ascii=False, separators=(",", ":")) + "\n"
+                    + json.dumps(later_legacy_success, separators=(",", ":")) + "\n").encode()
+        config = {
+            "notification_targets": [], "notification_pinned_targets": [],
+            "command_path": "/private/mail-forward-command", "log_path": log_path,
+        }
+        manager, _, deployer, output = self.make_manager(config=config, log_body=log_body)
+
+        manager.show_diagnostics()
+
+        expected = (
+            "Webhook診断: 2026年07月30日（木）08時10分49秒 / 失敗 / "
+            "HTTP 500 → 500 / コード E500 / 説明 internal server error / "
+            "応答形式 json / 再試行 未復旧 / ID 2ec3d48e5880"
+        )
+        self.assertIn(expected, output)
+        self.assertEqual([(log_path, 256 * 1024, "600")], deployer.log_reads)
+        rendered = "\n".join(output)
+        for private in (message_hash, response_hash):
+            self.assertNotIn(private, rendered)
+
+    def test_diagnostics_display_no_details_for_legacy_webhook_log(self):
+        log_path = "/home/example/mail-lineworks/private/log/mail-notifier.jsonl"
+        legacy = {
+            "timestamp": "2026-07-29T23:10:49+00:00",
+            "outcome": "failure",
+            "message_id_hash": "b" * 64,
+            "classification": "transport_error",
+            "http_status": None,
+        }
+        config = {
+            "notification_targets": [], "notification_pinned_targets": [],
+            "command_path": "/private/mail-forward-command", "log_path": log_path,
+        }
+        manager, _, _, output = self.make_manager(
+            config=config,
+            log_body=(json.dumps(legacy, separators=(",", ":")) + "\n").encode(),
+        )
+
+        manager.show_diagnostics()
+
+        self.assertIn("Webhook診断: 詳細診断情報なし", output)
+        self.assertNotIn("b" * 64, "\n".join(output))
+
+    def test_diagnostics_accept_error_reporter_success_logs_without_selecting_them(self):
+        log_path = "/home/example/mail-lineworks/private/log/mail-notifier.jsonl"
+        failure = webhook_diagnostic_event()
+        legacy_reporter_success = {
+            "timestamp": "2026-07-29T23:11:00+00:00",
+            "outcome": "success",
+            "message_id_hash": "3" * 64,
+            "classification": "internal_error",
+            "http_status": 200,
+        }
+        new_reporter_success = webhook_diagnostic_event(
+            timestamp="2026-07-29T23:12:00+00:00",
+            outcome="success", message_id_hash="4" * 64,
+            classification="internal_error", http_status=200,
+            attempt_count=1, attempt_http_statuses=[200],
+            provider_code=200, provider_description="success",
+            response_body_bytes=36, response_body_sha256="5" * 64,
+        )
+        log_body = "".join(
+            json.dumps(event, separators=(",", ":")) + "\n"
+            for event in (failure, legacy_reporter_success, new_reporter_success)
+        ).encode()
+        config = {
+            "notification_targets": [], "notification_pinned_targets": [],
+            "command_path": "/private/mail-forward-command", "log_path": log_path,
+        }
+        manager, _, _, output = self.make_manager(config=config, log_body=log_body)
+
+        manager.show_diagnostics()
+
+        rendered = "\n".join(output)
+        self.assertIn("Webhook診断: 2026年07月30日（木）08時10分49秒", rendered)
+        self.assertIn("ID 111111111111", rendered)
+        self.assertNotIn("診断ログを安全に読み取れません", rendered)
+
+    def test_diagnostics_hide_non_http_and_scheme_relative_provider_urls(self):
+        log_path = "/home/example/mail-lineworks/private/log/mail-notifier.jsonl"
+        secrets = ("ftp://private.example/secret", "//private.example/path")
+        event = webhook_diagnostic_event(
+            provider_code=secrets[0], provider_description=secrets[1]
+        )
+        config = {
+            "notification_targets": [], "notification_pinned_targets": [],
+            "command_path": "/private/mail-forward-command", "log_path": log_path,
+        }
+        manager, _, _, output = self.make_manager(
+            config=config,
+            log_body=(json.dumps(event, separators=(",", ":")) + "\n").encode(),
+        )
+
+        manager.show_diagnostics()
+
+        rendered = "\n".join(output)
+        self.assertIn("コード 非表示 / 説明 非表示", rendered)
+        for secret in secrets:
+            self.assertNotIn(secret, rendered)
+
+    def test_diagnostics_hide_bare_host_paths_without_hiding_normal_provider_text(self):
+        for secret in (
+            "private.example/path/to/secret",
+            "192.0.2.1/private/path",
+        ):
+            with self.subTest(secret=secret):
+                self.assertEqual(
+                    "非表示", MailManager._safe_webhook_diagnostic_text(secret)
+                )
+        for normal in (
+            "internal server error",
+            "E500",
+            "retry 1/2 failed",
+            "release 2026.07/path",
+        ):
+            with self.subTest(normal=normal):
+                self.assertEqual(
+                    normal, MailManager._safe_webhook_diagnostic_text(normal)
+                )
+
+    def test_diagnostics_display_sanitizer_restrips_all_control_ranges(self):
+        self.assertEqual(
+            "internal server error",
+            MailManager._safe_webhook_diagnostic_text(
+                "internal\u0000\u001f\u007f\u0085 server error"
+            ),
+        )
+
+    def test_diagnostics_accept_attempt_count_bounded_by_log_bytes_not_consumer_cap(self):
+        log_path = "/home/example/mail-lineworks/private/log/mail-notifier.jsonl"
+        event = webhook_diagnostic_event(
+            attempt_count=65, attempt_http_statuses=[500] * 65
+        )
+        config = {
+            "notification_targets": [], "notification_pinned_targets": [],
+            "command_path": "/private/mail-forward-command", "log_path": log_path,
+        }
+        manager, _, _, output = self.make_manager(
+            config=config,
+            log_body=(json.dumps(event, separators=(",", ":")) + "\n").encode(),
+        )
+
+        manager.show_diagnostics()
+
+        rendered = "\n".join(output)
+        self.assertIn("ID 111111111111", rendered)
+        self.assertNotIn("診断ログを安全に読み取れません", rendered)
+
+    def test_diagnostics_scan_exactly_the_last_one_thousand_lines(self):
+        log_path = "/home/example/mail-lineworks/private/log/mail-notifier.jsonl"
+        legacy_success = json.dumps({
+            "timestamp": "2026-07-29T23:09:00+00:00",
+            "outcome": "success",
+            "message_id_hash": "6" * 64,
+            "classification": "success",
+            "http_status": 200,
+        }, separators=(",", ":")).encode()
+        failure = json.dumps(
+            webhook_diagnostic_event(), separators=(",", ":")
+        ).encode()
+        config = {
+            "notification_targets": [], "notification_pinned_targets": [],
+            "command_path": "/private/mail-forward-command", "log_path": log_path,
+        }
+
+        outside_body = b"\n".join(
+            [b"malformed outside tail", *([legacy_success] * 999), failure, b""]
+        )
+        manager, _, _, _ = self.make_manager(config=config, log_body=outside_body)
+        outside = manager._latest_webhook_diagnostic(config)["webhook_diagnostic"]
+        self.assertIn("ID 111111111111", outside)
+
+        inside_body = b"\n".join(
+            [legacy_success, b"malformed inside tail", *([legacy_success] * 998),
+             failure, b""]
+        )
+        manager, _, _, _ = self.make_manager(config=config, log_body=inside_body)
+        self.assertEqual(
+            "診断ログを安全に読み取れません",
+            manager._latest_webhook_diagnostic(config)["webhook_diagnostic"],
+        )
+
+    def test_diagnostics_hide_sensitive_provider_values_in_valid_events(self):
+        log_path = "/home/example/mail-lineworks/private/log/mail-notifier.jsonl"
+        cases = (
+            ({"provider_code": "ops@example.invalid"}, "ops@example.invalid", "コード 非表示"),
+            ({"provider_description": "7" * 64}, "7" * 64, "説明 非表示"),
+            ({"provider_code": "private.example/path"}, "private.example/path", "コード 非表示"),
+            ({"provider_description": "192.0.2.1/private"},
+             "192.0.2.1/private", "説明 非表示"),
+        )
+        config = {
+            "notification_targets": [], "notification_pinned_targets": [],
+            "command_path": "/private/mail-forward-command", "log_path": log_path,
+        }
+        for overrides, secret, expected in cases:
+            with self.subTest(secret=secret):
+                event = webhook_diagnostic_event(**overrides)
+                manager, _, _, output = self.make_manager(
+                    config=config,
+                    log_body=(json.dumps(event, separators=(",", ":")) + "\n").encode(),
+                )
+                manager.show_diagnostics()
+                rendered = "\n".join(output)
+                self.assertIn(expected, rendered)
+                self.assertNotIn(secret, rendered)
+
+    def test_diagnostics_accept_producer_correlated_response_metadata(self):
+        log_path = "/home/example/mail-lineworks/private/log/mail-notifier.jsonl"
+        valid_events = {
+            "transport": webhook_diagnostic_event(
+                classification="transport_error", http_status=None,
+                attempt_http_statuses=[None], provider_code=None,
+                provider_description=None, response_format="transport_error",
+                response_content_type=None, response_body_bytes=0,
+                response_body_sha256=None,
+            ),
+            "invalid_json": webhook_diagnostic_event(
+                classification="http_error", http_status=502,
+                attempt_http_statuses=[502], provider_code=None,
+                provider_description=None, response_format="invalid_json",
+                response_content_type="text/html", response_body_bytes=19,
+            ),
+            "json_failure": webhook_diagnostic_event(
+                classification="invalid_parameter", http_status=400,
+                attempt_http_statuses=[400], provider_code="E400",
+                provider_description="invalid parameter",
+            ),
+            "reporter_success": webhook_diagnostic_event(
+                outcome="success", classification="internal_error", http_status=200,
+                attempt_http_statuses=[200], provider_code=200,
+                provider_description="success", response_body_bytes=36,
+                recovered_by_retry=False,
+            ),
+            "recovered_retry": webhook_diagnostic_event(
+                outcome="success", classification="internal_error", http_status=200,
+                attempt_count=2, attempt_http_statuses=[500, 200],
+                recovered_by_retry=True,
+            ),
+            "chunked_success": webhook_diagnostic_event(
+                outcome="success", classification="success", http_status=200,
+                attempt_count=2, attempt_http_statuses=[400, 200],
+                provider_code="E400", provider_description="invalid parameter",
+                recovered_by_retry=False,
+            ),
+            "later_failure_after_recovered_chunk": webhook_diagnostic_event(
+                outcome="failure", classification="http_error", http_status=500,
+                attempt_count=5, attempt_http_statuses=[400, 500, 200, 500, 500],
+                recovered_by_retry=True,
+            ),
+        }
+        config = {
+            "notification_targets": [], "notification_pinned_targets": [],
+            "command_path": "/private/mail-forward-command", "log_path": log_path,
+        }
+        for name, event in valid_events.items():
+            with self.subTest(name=name):
+                manager, _, _, output = self.make_manager(
+                    config=config,
+                    log_body=(json.dumps(event, separators=(",", ":")) + "\n").encode(),
+                )
+                manager.show_diagnostics()
+                self.assertNotIn(
+                    "診断ログを安全に読み取れません", "\n".join(output)
+                )
+
+    def test_diagnostics_reject_response_metadata_impossible_for_producer(self):
+        log_path = "/home/example/mail-lineworks/private/log/mail-notifier.jsonl"
+        transport = webhook_diagnostic_event(
+            classification="transport_error", http_status=None,
+            attempt_http_statuses=[None], provider_code=None,
+            provider_description=None, response_format="transport_error",
+            response_content_type=None, response_body_bytes=0,
+            response_body_sha256=None,
+        )
+        invalid_json = webhook_diagnostic_event(
+            classification="http_error", http_status=502,
+            attempt_http_statuses=[502], provider_code=None,
+            provider_description=None, response_format="invalid_json",
+            response_content_type="text/html", response_body_bytes=19,
+        )
+        invalid_events = {
+            "transport_content_type": {**transport, "response_content_type": "text/plain"},
+            "transport_classification": {**transport, "classification": "http_error"},
+            "transport_http_status": {
+                **transport, "http_status": 500, "attempt_http_statuses": [500],
+            },
+            "invalid_json_code": {**invalid_json, "provider_code": "E502"},
+            "invalid_json_description": {
+                **invalid_json, "provider_description": "gateway error",
+            },
+            "invalid_json_classification": {
+                **invalid_json, "classification": "invalid_parameter",
+            },
+            "json_without_http": webhook_diagnostic_event(
+                http_status=None, attempt_http_statuses=[None]
+            ),
+            "http_after_transport": webhook_diagnostic_event(
+                attempt_count=2, attempt_http_statuses=[None, 500]
+            ),
+            "json_classification_mismatch": webhook_diagnostic_event(
+                classification="http_error", http_status=400,
+                attempt_http_statuses=[400], provider_description="invalid parameter",
+            ),
+            "json_c0_description": webhook_diagnostic_event(
+                classification="http_error", provider_description="server\u0001 error",
+            ),
+            "json_del_description": webhook_diagnostic_event(
+                classification="http_error", provider_description="invalid\u007f parameter",
+            ),
+            "json_c1_description": webhook_diagnostic_event(
+                classification="http_error", provider_description="invalid\u0085 parameter",
+            ),
+            "successful_tuple_as_failure": webhook_diagnostic_event(
+                http_status=200, attempt_http_statuses=[200], provider_code=200,
+                provider_description="success",
+            ),
+            "failed_tuple_as_success": webhook_diagnostic_event(
+                outcome="success", classification="success", http_status=200,
+                attempt_http_statuses=[200],
+            ),
+            "recovered_transport": {
+                **transport, "outcome": "success", "classification": "success",
+                "http_status": 200, "attempt_count": 2,
+                "attempt_http_statuses": [None, 200], "recovered_by_retry": True,
+            },
+            "recovered_nonretryable": webhook_diagnostic_event(
+                outcome="success", classification="success", http_status=200,
+                attempt_count=2, attempt_http_statuses=[400, 200],
+                provider_code="E400", provider_description="invalid parameter",
+                recovered_by_retry=True,
+            ),
+        }
+        config = {
+            "notification_targets": [], "notification_pinned_targets": [],
+            "command_path": "/private/mail-forward-command", "log_path": log_path,
+        }
+        for name, event in invalid_events.items():
+            with self.subTest(name=name):
+                manager, _, _, output = self.make_manager(
+                    config=config,
+                    log_body=(json.dumps(event, separators=(",", ":")) + "\n").encode(),
+                )
+                self.assertEqual(
+                    "診断ログを安全に読み取れません",
+                    manager._latest_webhook_diagnostic(config)["webhook_diagnostic"],
+                )
+
+    def test_diagnostics_fail_closed_for_invalid_or_unreadable_webhook_log(self):
+        log_path = "/home/example/mail-lineworks/private/log/mail-notifier.jsonl"
+        invalid = {
+            "timestamp": "2026-07-29T23:10:49+00:00",
+            "outcome": "failure",
+            "message_id_hash": "c" * 64,
+            "classification": "http_error",
+            "http_status": 500,
+            "recipient": "private@example.invalid",
+            "webhook_url": "https://webhook.worksmobile.com/message/private-token",
+        }
+        config = {
+            "notification_targets": [], "notification_pinned_targets": [],
+            "command_path": "/private/mail-forward-command", "log_path": log_path,
+        }
+        cases = (
+            {
+                "log_body": (json.dumps(invalid, separators=(",", ":")) + "\n").encode(),
+                "log_error": None,
+            },
+            {
+                "log_body": (
+                    b'{"timestamp":"2026-07-29T23:10:49+00:00",'
+                    b'"outcome":"failure","message_id_hash":"'
+                    + b"e" * 64
+                    + b'","classification":"http_error","http_status":500,'
+                    b'"attempt_count":1,"attempt_http_statuses":[500],'
+                    b'"provider_code":"E500","provider_description":"first",'
+                    b'"provider_description":"second","response_format":"json",'
+                    b'"response_content_type":"application/json",'
+                    b'"response_body_bytes":2,"response_body_sha256":"'
+                    + b"f" * 64
+                    + b'","payload_bytes":10,"title_characters":1,'
+                    b'"text_characters":1,"recovered_by_retry":false}\n'
+                ),
+                "log_error": None,
+            },
+            {
+                "log_body": b"",
+                "log_error": RuntimeError(
+                    "0644 private@example.invalid private-token " + "d" * 64
+                ),
+            },
+        )
+        for case in cases:
+            with self.subTest(error=case["log_error"] is not None):
+                manager, _, _, output = self.make_manager(config=config, **case)
+                manager.show_diagnostics()
+                rendered = "\n".join(output)
+                self.assertIn("Webhook診断: 診断ログを安全に読み取れません", output)
+                for private in (
+                    "private@example.invalid", "private-token", "c" * 64, "d" * 64,
+                    "e" * 64, "f" * 64,
+                ):
+                    self.assertNotIn(private, rendered)
 
     def test_diagnostics_report_missing_healthy_and_degraded_health_in_japanese(self):
         cases = (

@@ -16,6 +16,7 @@ from pathlib import Path, PurePosixPath
 _MACOS_CA_FILE = "/etc/ssl/cert.pem"
 _TRUSTED_CA_OWNER_UID = 0
 _MAX_CA_FILE_SIZE = 4 * 1024 * 1024
+_MAX_PRIVATE_LOG_BYTES = 256 * 1024
 _PEM_CERTIFICATE_MARKER = b"-----BEGIN CERTIFICATE-----"
 
 
@@ -233,6 +234,45 @@ class FtpsDeployer:
             raise RuntimeError("remote readback is too large")
         return bytes(body)
 
+    def read_private_log_tail(self, remote_path: str, *, limit: int,
+                              expected_mode: str = "600") -> bytes:
+        """Read one owner-only operational log from the fixed private tree."""
+        if (type(remote_path) is not str or type(limit) is not int
+                or limit < 0 or limit > _MAX_PRIVATE_LOG_BYTES
+                or expected_mode != "600" or self.filesystem_home is None
+                or "//" in remote_path):
+            raise ValueError("private log read request is invalid")
+        self._validate_private(remote_path)
+        filesystem_root = PurePosixPath(self.filesystem_home) / "mail-lineworks/private"
+        try:
+            relative_path = PurePosixPath(remote_path).relative_to(filesystem_root)
+        except ValueError:
+            raise ValueError("private log path is invalid") from None
+        if not relative_path.parts:
+            raise ValueError("private log path is invalid")
+        ftp_path = (PurePosixPath("/mail-lineworks/private") / relative_path).as_posix()
+        self._validate_private(ftp_path)
+
+        body = bytearray()
+
+        def receive(chunk):
+            if not isinstance(chunk, bytes) or len(body) + len(chunk) > limit:
+                raise RuntimeError("remote private log could not be read")
+            body.extend(chunk)
+
+        ftp = self._connect()
+        try:
+            try:
+                self._verify_mlst_mode(
+                    ftp.sendcmd("MLST " + ftp_path), ftp_path, expected_mode
+                )
+                ftp.retrbinary("RETR " + ftp_path, receive)
+            except (RuntimeError,) + all_errors:
+                raise RuntimeError("remote private log could not be read") from None
+        finally:
+            ftp.quit()
+        return bytes(body)
+
     def read_optional_bytes(self, remote_path, *, limit):
         """Return None only for an FTP 550 missing-path response."""
         try:
@@ -262,32 +302,52 @@ class FtpsDeployer:
         """Bind one canonical absolute-path MLST entry to its requested file."""
         if not isinstance(response, str):
             raise RuntimeError("remote file mode could not be verified")
+        lines = [line.rstrip("\r") for line in response.splitlines()]
+        if (len(lines) >= 3 and re.fullmatch(r"250-.*", lines[0]) is not None
+                and re.fullmatch(r"250 .*", lines[-1]) is not None):
+            entry_lines = lines[1:-1]
+            if any(re.match(r"[0-9]{3}[- ]", line) for line in entry_lines):
+                raise RuntimeError("remote file mode could not be verified")
+        elif len(lines) == 1 and re.fullmatch(r"250 .+", lines[0]) is not None:
+            entry_lines = [lines[0][4:]]
+        else:
+            raise RuntimeError("remote file mode could not be verified")
         entries = []
-        for raw_line in response.splitlines():
-            line = raw_line.strip()
-            if line.startswith("250 "):
-                line = line[4:]
-            if ";" not in line or " " not in line:
+        for line in entry_lines:
+            stripped = line.strip()
+            if not stripped:
                 continue
-            fact_text, pathname = line.split(None, 1)
-            tokens = [token for token in fact_text.split(";") if token]
-            if not pathname or not tokens or any("=" not in token for token in tokens):
+            fact_like = (
+                re.match(r"[A-Za-z0-9._-]+=", stripped) is not None
+                or re.match(
+                    r"(?i)(?:unix[.]mode|perm-mode|type)(?:\s|;)", stripped
+                ) is not None
+            )
+            if not fact_like:
                 continue
+            if " " not in stripped:
+                raise RuntimeError("remote file mode could not be verified")
+            fact_text, pathname = stripped.split(None, 1)
+            if not fact_text.endswith(";") or not pathname:
+                raise RuntimeError("remote file mode could not be verified")
+            tokens = fact_text[:-1].split(";")
+            if not tokens:
+                raise RuntimeError("remote file mode could not be verified")
             facts = {}
-            duplicate = False
             for token in tokens:
+                if (token.count("=") != 1
+                        or re.fullmatch(r"[A-Za-z0-9._-]+=[^;]+", token) is None):
+                    raise RuntimeError("remote file mode could not be verified")
                 name, value = token.split("=", 1)
                 name = name.casefold()
                 if name in facts:
-                    duplicate = True
-                    break
+                    raise RuntimeError("remote file mode could not be verified")
                 facts[name] = value
-            if not duplicate and facts.get("type", "").casefold() == "file":
-                entries.append((pathname, facts))
+            entries.append((pathname, facts))
         if len(entries) != 1:
             raise RuntimeError("remote file mode could not be verified")
         pathname, facts = entries[0]
-        if pathname != remote_path:
+        if pathname != remote_path or facts.get("type", "").casefold() != "file":
             raise RuntimeError("remote file mode could not be verified")
         mode_values = [facts[name] for name in ("unix.mode", "perm-mode") if name in facts]
         if mode_values != ["0" + expected_mode]:

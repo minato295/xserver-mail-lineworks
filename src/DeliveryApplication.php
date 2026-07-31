@@ -108,7 +108,13 @@ final class DeliveryApplication
             } else {
                 $this->releaseReservation($messageIdHash, $reservation);
             }
-            $this->logger->log($result->isSuccess() ? 'success' : 'failure', $messageIdHash, $result->classification, $result->httpStatus);
+            $this->logger->log(
+                $result->isSuccess() ? 'success' : 'failure',
+                $messageIdHash,
+                $result->classification,
+                $result->httpStatus,
+                $result->diagnostic,
+            );
         } catch (Throwable $error) {
             $this->releaseReservation($messageIdHash, $reservation);
             $this->safeReport($error, $messageIdHash);

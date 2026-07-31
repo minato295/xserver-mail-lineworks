@@ -17,6 +17,8 @@ use XserverMail\SendmailProcessAdapter;
 use XserverMail\SendmailProcessHandle;
 use XserverMail\SystemMailAuthenticator;
 use XserverMail\WebhookClient;
+use XserverMail\WebhookAttemptDiagnostic;
+use XserverMail\WebhookDiagnostic;
 use XserverMail\StdinFrame;
 
 function deliveryCheck(bool $condition, string $message): void
@@ -252,6 +254,238 @@ deliveryCheck($rateLimited->send('Title', 'Text')->isSuccess(), 'One bounded 429
 deliveryCheck(count($attempts) === 2 && $attempts[0] === $attempts[1], '429 retry must reuse the identical payload once');
 deliveryCheck($sleeps === [2], '429 retry must honor a bounded RateLimit-Reset');
 
+$serverAttempts = [];
+$serverSleeps = [];
+$serverFailure = new WebhookClient(
+    'https://webhook.worksmobile.com/message/test-placeholder',
+    static function (string $url, string $payload) use (&$serverAttempts): array {
+        $serverAttempts[] = $payload;
+        return count($serverAttempts) === 1
+            ? response(500, 'server error')
+            : response(200, 'success');
+    },
+    256,
+    static function (int $seconds) use (&$serverSleeps): void { $serverSleeps[] = $seconds; },
+);
+deliveryCheck($serverFailure->send('Title', 'Text')->isSuccess(), 'One bounded HTTP 5xx retry may succeed');
+deliveryCheck(
+    count($serverAttempts) === 2 && $serverAttempts[0] === $serverAttempts[1],
+    'HTTP 5xx retry must reuse the identical payload once',
+);
+deliveryCheck($serverSleeps === [5], 'HTTP 5xx retry must wait before retrying');
+
+foreach ([
+    ['429-then-500', [
+        response(429, 'too many request', ['RateLimit-Reset' => '1']),
+        response(500, 'server error'),
+    ], [1], [429, 500]],
+    ['500-then-429', [
+        response(500, 'server error'),
+        response(429, 'too many request', ['RateLimit-Reset' => '1']),
+    ], [5], [500, 429]],
+] as [$label, $responses, $expectedSleeps, $expectedStatuses]) {
+    $crossCalls = 0;
+    $crossSleeps = [];
+    $crossClient = new WebhookClient(
+        'https://webhook.worksmobile.com/message/test-placeholder',
+        static function () use (&$crossCalls, &$responses): array {
+            ++$crossCalls;
+            return array_shift($responses);
+        },
+        256,
+        static function (int $seconds) use (&$crossSleeps): void { $crossSleeps[] = $seconds; },
+    );
+    $crossResult = $crossClient->send('Title', 'Text');
+    deliveryCheck(!$crossResult->isSuccess() && $crossCalls === 2,
+        $label . ' must stop after two identical-payload sends');
+    deliveryCheck($crossSleeps === $expectedSleeps,
+        $label . ' must sleep only for the initial retry transition');
+    deliveryCheck($crossResult->diagnostic?->attemptHttpStatuses() === $expectedStatuses,
+        $label . ' must retain exactly two state-machine attempts');
+}
+
+foreach ([null, '-1', '16', '1.5'] as $invalidReset) {
+    $invalidResetCalls = 0;
+    $headers = $invalidReset === null ? [] : ['RateLimit-Reset' => $invalidReset];
+    $invalidResetClient = new WebhookClient(
+        'https://webhook.worksmobile.com/message/test-placeholder',
+        static function () use (&$invalidResetCalls, $headers): array {
+            ++$invalidResetCalls;
+            return response(429, 'too many request', $headers);
+        },
+        256,
+        static function (): void { throw new RuntimeException('Invalid reset must not sleep'); },
+    );
+    deliveryCheck(!$invalidResetClient->send('Title', 'Text')->isSuccess()
+        && $invalidResetCalls === 1, 'Invalid RateLimit-Reset must not transition to retry');
+}
+
+$echoedDescription = 'private payload fragment';
+$echoResult = (new WebhookClient(
+    'https://webhook.worksmobile.com/message/test-placeholder',
+    static fn (): array => response(400, $echoedDescription),
+))->send('Title', 'Prefix ' . $echoedDescription . ' suffix');
+deliveryCheck($echoResult->diagnostic?->attempts[0]->providerDescription === null,
+    'Provider description that directly echoes an 8+ character payload fragment must not be retained');
+
+$wrappedEchoResult = (new WebhookClient(
+    'https://webhook.worksmobile.com/message/test-placeholder',
+    static fn (): array => response(400, 'provider rejected: private payload fragment (invalid)'),
+))->send('Title', 'Prefix private payload fragment suffix');
+deliveryCheck($wrappedEchoResult->diagnostic?->attempts[0]->providerDescription === null,
+    'Provider description with a prefix and suffix around an 8-byte payload fragment must be redacted');
+
+$japaneseEchoResult = (new WebhookClient(
+    'https://webhook.worksmobile.com/message/test-placeholder',
+    static fn (): array => response(400, 'エラー: 秘密情報 が含まれます'),
+))->send('件名に秘密情報があります', '本文');
+deliveryCheck($japaneseEchoResult->diagnostic?->attempts[0]->providerDescription === null,
+    'Provider description sharing eight payload bytes inside Japanese text must be redacted');
+
+$providerCodeCases = [
+    ['ascii-prefix-suffix', 'provider-prefix private-code-fragment provider-suffix',
+        'Title', 'Text private-code-fragment tail', null],
+    ['japanese-prefix-suffix', 'コード: 秘密情報 :終端',
+        '件名に秘密情報があります', '本文', null],
+    ['seven-byte-fragment', 'seven77',
+        'Title', 'Text seven77 tail', 'seven77'],
+    ['unrelated', 'E_VALIDATION_42',
+        'Unrelated title', 'Completely separate webhook body', 'E_VALIDATION_42'],
+];
+$codeEchoResult = null;
+foreach ($providerCodeCases as [$label, $providerCode, $codeTitle, $codeText, $expectedCode]) {
+    $codeResult = (new WebhookClient(
+        'https://webhook.worksmobile.com/message/test-placeholder',
+        static fn (): array => [
+            'status' => 400,
+            'body' => json_encode([
+                'code' => $providerCode,
+                'description' => 'ordinary provider explanation',
+            ], JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE),
+            'headers' => [],
+        ],
+    ))->send($codeTitle, $codeText);
+    deliveryCheck($codeResult->diagnostic?->attempts[0]->providerCode === $expectedCode,
+        $label . ' string provider code must follow the exact eight-byte payload echo boundary');
+    if ($label === 'ascii-prefix-suffix') {
+        $codeEchoResult = $codeResult;
+    }
+}
+deliveryCheck($codeEchoResult instanceof \XserverMail\WebhookResult,
+    'Persistent provider-code echo fixture must be available');
+
+$integerCodeResult = (new WebhookClient(
+    'https://webhook.worksmobile.com/message/test-placeholder',
+    static fn (): array => response(400, 'ordinary provider explanation'),
+))->send('Title 400', 'Text 400');
+deliveryCheck($integerCodeResult->diagnostic?->attempts[0]->providerCode === 400,
+    'Integer provider codes must remain available and must not enter text echo detection');
+
+$largeEchoText = str_repeat('x', 10 * 1024 * 1024) . 'private-tail-fragment';
+if (function_exists('memory_reset_peak_usage')) {
+    memory_reset_peak_usage();
+}
+$largeEchoBaselineMemory = memory_get_usage(true);
+$largeEchoStarted = microtime(true);
+$largeEchoResult = (new WebhookClient(
+    'https://webhook.worksmobile.com/message/test-placeholder',
+    static fn (): array => response(400, 'provider prefix private-tail-fragment provider suffix'),
+))->send('Title', $largeEchoText);
+$largeEchoElapsed = microtime(true) - $largeEchoStarted;
+deliveryCheck($largeEchoResult->diagnostic?->attempts[0]->providerDescription === null,
+    'Provider description sharing an internal fragment with a 10 MiB payload must be redacted');
+deliveryCheck($largeEchoElapsed < 5.0,
+    'Payload echo detection must scan a 10 MiB payload without repeated pathological full-string searches');
+if (function_exists('memory_reset_peak_usage')) {
+    deliveryCheck(memory_get_peak_usage(true) - $largeEchoBaselineMemory < 18 * 1024 * 1024,
+        'Payload echo detection must not decode and duplicate the full 10 MiB payload JSON');
+}
+
+$unrelatedDescription = 'ordinary provider explanation';
+$unrelatedEchoResult = (new WebhookClient(
+    'https://webhook.worksmobile.com/message/test-placeholder',
+    static fn (): array => response(400, $unrelatedDescription),
+))->send('Unrelated title', 'Completely separate webhook body');
+deliveryCheck($unrelatedEchoResult->diagnostic?->attempts[0]->providerDescription === $unrelatedDescription,
+    'Unrelated provider descriptions must remain diagnostically useful');
+
+$shortEchoResult = (new WebhookClient(
+    'https://webhook.worksmobile.com/message/test-placeholder',
+    static fn (): array => response(400, 'seven77'),
+))->send('Title', 'Prefix seven77 suffix');
+deliveryCheck($shortEchoResult->diagnostic?->attempts[0]->providerDescription === 'seven77',
+    'Provider description shorter than eight characters must remain diagnostically useful');
+
+$diagnosticResponses = [
+    [
+        'status' => 500,
+        'body' => "{\"code\":\"E500\",\"description\":\"temporary\\u0000 failure\"}",
+        'headers' => ['Content-Type' => 'application/json; charset=UTF-8'],
+    ],
+    response(200, 'success'),
+];
+$diagnosticClient = new WebhookClient(
+    'https://webhook.worksmobile.com/message/test-placeholder',
+    static function () use (&$diagnosticResponses): array {
+        return array_shift($diagnosticResponses);
+    },
+    256,
+    static function (): void {},
+);
+$diagnosticResult = $diagnosticClient->send('題名', '本文');
+deliveryCheck($diagnosticResult->isSuccess(), 'HTTP 5xx retry must recover');
+deliveryCheck($diagnosticResult->diagnostic instanceof WebhookDiagnostic, 'Webhook result must expose diagnostics');
+deliveryCheck($diagnosticResult->diagnostic->attemptHttpStatuses() === [500, 200], 'Diagnostics must preserve both statuses');
+deliveryCheck($diagnosticResult->diagnostic->recoveredByRetry, 'Retry recovery must be explicit');
+deliveryCheck($diagnosticResult->diagnostic->attempts[0]->providerCode === 'E500', 'Provider code must be preserved safely');
+deliveryCheck($diagnosticResult->diagnostic->attempts[0]->providerDescription === 'temporary failure', 'Controls must be removed');
+
+foreach ([
+    ['provider code at 64', str_repeat('c', 64), 'description', 'text/plain', str_repeat('c', 64), 'description', 'text/plain'],
+    ['provider code at 65', str_repeat('c', 65), 'description', 'text/plain', str_repeat('c', 64), 'description', 'text/plain'],
+    ['provider description at 200', 'code', str_repeat('d', 200), 'text/plain', 'code', str_repeat('d', 200), 'text/plain'],
+    ['provider description at 201', 'code', str_repeat('d', 201), 'text/plain', 'code', str_repeat('d', 200), 'text/plain'],
+    ['content type at 100', 'code', 'description', str_repeat('t', 100), 'code', 'description', str_repeat('t', 100)],
+    ['content type at 101', 'code', 'description', str_repeat('t', 101), 'code', 'description', str_repeat('t', 100)],
+    ['C1 controls', "co\u{0085}de", "desc\u{0085}ription", "text/\u{0085}plain", 'code', 'description', 'text/plain'],
+] as [$limitCase, $code, $description, $contentType, $expectedCode, $expectedDescription, $expectedContentType]) {
+    $limitResult = (new WebhookClient(
+        'https://webhook.worksmobile.com/message/test-placeholder',
+        static fn (): array => [
+            'status' => 400,
+            'body' => json_encode(['code' => $code, 'description' => $description], JSON_THROW_ON_ERROR),
+            'headers' => ['Content-Type' => $contentType],
+        ],
+    ))->send('Title', 'Text');
+    $limitAttempt = $limitResult->diagnostic?->attempts[0] ?? null;
+    deliveryCheck($limitAttempt?->providerCode === $expectedCode, $limitCase . ' must use its exact code boundary');
+    deliveryCheck($limitAttempt?->providerDescription === $expectedDescription, $limitCase . ' must use its exact description boundary');
+    deliveryCheck($limitAttempt?->responseContentType === $expectedContentType, $limitCase . ' must use its exact content type boundary');
+}
+
+$invalidJsonBody = 'untrusted response body placeholder';
+$invalidJsonResult = (new WebhookClient(
+    'https://webhook.worksmobile.com/message/test-placeholder',
+    static fn (): array => ['status' => 502, 'body' => $invalidJsonBody, 'headers' => []],
+))->send('Title', 'Text');
+deliveryCheck($invalidJsonResult->diagnostic instanceof WebhookDiagnostic, 'Invalid JSON result must expose diagnostics');
+$invalidJsonAttempt = $invalidJsonResult->diagnostic->attempts[0];
+deliveryCheck($invalidJsonAttempt->responseFormat === 'invalid_json', 'Non-JSON response must be identified without retaining its body');
+deliveryCheck(!array_key_exists('responseBody', get_object_vars($invalidJsonAttempt)), 'Diagnostics must not expose a response body');
+deliveryCheck(!str_contains(serialize($invalidJsonAttempt), $invalidJsonBody), 'Diagnostics must not retain a response body');
+
+$transportMessage = 'transport secret placeholder';
+$transportResult = (new WebhookClient(
+    'https://webhook.worksmobile.com/message/test-placeholder',
+    static function () use ($transportMessage): array {
+        throw new RuntimeException($transportMessage);
+    },
+))->send('Title', 'Text');
+deliveryCheck($transportResult->diagnostic instanceof WebhookDiagnostic, 'Transport result must expose diagnostics');
+$transportAttempt = $transportResult->diagnostic->attempts[0];
+deliveryCheck($transportAttempt->responseFormat === 'transport_error', 'Transport exceptions must be identified without their message');
+deliveryCheck(!str_contains(serialize($transportAttempt), $transportMessage), 'Diagnostics must not retain exception messages');
+
 foreach ([
     'missing parameter ' => 'missing_parameter',
     'invalid webhook URL ' => 'invalid_webhook_url',
@@ -302,31 +536,715 @@ $timeout = new WebhookClient(
 deliveryCheck(!$timeout->send('Title', str_repeat('x', 500))->isSuccess(), 'Transport timeout must fail safely');
 deliveryCheck($timeoutCalls === 1, 'Ambiguous timeout must not retry or split');
 
-$logPath = tempnam(sys_get_temp_dir(), 'delivery-log-');
-if ($logPath === false) {
-    throw new RuntimeException('Could not create test log');
-}
+$logDirectory = sys_get_temp_dir() . '/delivery-log-' . bin2hex(random_bytes(8));
+mkdir($logDirectory, 0700);
+$logDirectory = realpath($logDirectory);
+deliveryCheck(is_string($logDirectory), 'Operational log fixture directory must resolve');
+$logPath = $logDirectory . '/operational.jsonl';
 $logger = new OperationalLogger($logPath);
-$successfulReporter = new ErrorReporter(
-    new WebhookClient('https://webhook.worksmobile.com/message/test', static fn (): array => response(200, 'success')),
-    $logger,
+$echoLogPath = $logDirectory . '/provider-echo.jsonl';
+(new OperationalLogger($echoLogPath))->log(
+    'failure', str_repeat('9', 64), $echoResult->classification,
+    $echoResult->httpStatus, $echoResult->diagnostic,
 );
-$successfulReporter->report(new RuntimeException('sensitive-value-placeholder'), str_repeat('a', 64));
+$echoLogBytes = (string) file_get_contents($echoLogPath);
+deliveryCheck(!str_contains($echoLogBytes, $echoedDescription)
+    && str_contains($echoLogBytes, '"provider_description":null'),
+    'Direct provider echo of a payload fragment must not reach persistent diagnostics');
+$codeEchoLogPath = $logDirectory . '/provider-code-echo.jsonl';
+(new OperationalLogger($codeEchoLogPath))->log(
+    'failure', str_repeat('8', 64), $codeEchoResult->classification,
+    $codeEchoResult->httpStatus, $codeEchoResult->diagnostic,
+);
+$codeEchoLogBytes = (string) file_get_contents($codeEchoLogPath);
+deliveryCheck(!str_contains($codeEchoLogBytes, 'private-code-fragment')
+    && str_contains($codeEchoLogBytes, '"provider_code":null'),
+    'String provider-code payload echo must not reach persistent diagnostics');
+$logger->log('success', str_repeat('0', 64), 'success', 200);
+$logger->log(
+    'success', str_repeat('1', 64), 'success', 200, $diagnosticResult->diagnostic,
+);
 
-$failedReporter = new ErrorReporter(
-    new WebhookClient('https://webhook.worksmobile.com/message/test', static fn (): array => response(500, 'server error')),
+$applicationResponses = [
+    [
+        'status' => 500,
+        'body' => '{"code":"E500","description":"temporary failure","raw":"RESPONSE_BODY_MARKER"}',
+        'headers' => ['Content-Type' => 'application/json'],
+    ],
+    response(200, 'success'),
+];
+$applicationWebhook = new WebhookClient(
+    'https://webhook.worksmobile.com/message/secret-placeholder',
+    static function () use (&$applicationResponses): array { return array_shift($applicationResponses); },
+    256,
+    static function (): void {},
+);
+$applicationReporter = new ErrorReporter($applicationWebhook, $logger);
+(new DeliveryApplication($applicationWebhook, $applicationReporter, $logger))->deliver(
+    "From: ADDRESS_MARKER@example.invalid\r\n"
+    . "To: receiver@example.invalid\r\n"
+    . "Subject: SUBJECT_MARKER\r\n"
+    . "Content-Type: multipart/mixed; boundary=x\r\n\r\n"
+    . "--x\r\nContent-Type: text/plain\r\n\r\nMAIL_BODY_MARKER\r\n"
+    . "--x\r\nContent-Disposition: attachment; filename=ATTACHMENT_MARKER.txt\r\n\r\nx\r\n--x--\r\n",
+);
+
+$reporter = new ErrorReporter(
+    new WebhookClient(
+        'https://webhook.worksmobile.com/message/test-placeholder',
+        static fn (): array => [
+            'status' => 400,
+            'body' => '{"code":"E400","description":"invalid parameter","raw":"REPORTER_RESPONSE_BODY_MARKER"}',
+            'headers' => ['Content-Type' => 'application/json'],
+        ],
+    ),
     $logger,
 );
-$failedReporter->report(new RuntimeException('token=secret-placeholder'), str_repeat('b', 64));
+$reporter->report(new RuntimeException('EXCEPTION_MESSAGE_MARKER'), str_repeat('b', 64));
 
 $logs = file_get_contents($logPath);
 deliveryCheck($logs !== false && $logs !== '', 'Operational events must be logged');
-deliveryCheck(!str_contains($logs, 'secret-placeholder') && !str_contains($logs, '/message/test'), 'Logs must never contain webhook URLs, exception messages, or secret values');
-foreach (array_filter(explode("\n", (string) $logs)) as $line) {
-    $event = json_decode($line, true, 512, JSON_THROW_ON_ERROR);
-    deliveryCheck(array_keys($event) === ['timestamp', 'outcome', 'message_id_hash', 'classification', 'http_status'], 'Logs must contain only the allowlisted fields');
+$events = array_map(
+    static fn (string $line): array => json_decode($line, true, 512, JSON_THROW_ON_ERROR),
+    array_values(array_filter(explode("\n", (string) $logs))),
+);
+deliveryCheck(array_keys($events[0]) === [
+    'timestamp', 'outcome', 'message_id_hash', 'classification', 'http_status',
+], 'Diagnostic-free logs must preserve the legacy five-field schema');
+$event = $events[1];
+deliveryCheck(array_keys($event) === [
+    'timestamp', 'outcome', 'message_id_hash', 'classification', 'http_status',
+    'attempt_count', 'attempt_http_statuses', 'provider_code', 'provider_description',
+    'response_format', 'response_content_type', 'response_body_bytes', 'response_body_sha256',
+    'payload_bytes', 'title_characters', 'text_characters', 'recovered_by_retry',
+], 'Diagnostic logs must contain exactly the allowlisted fields');
+deliveryCheck(array_slice($event, 5, null, true) === [
+    'attempt_count' => 2,
+    'attempt_http_statuses' => [500, 200],
+    'provider_code' => 'E500',
+    'provider_description' => 'temporary failure',
+    'response_format' => 'json',
+    'response_content_type' => 'application/json; charset=UTF-8',
+    'response_body_bytes' => 55,
+    'response_body_sha256' => 'e75177c2c53517db46aa9c0e13571a1e9f5b28f867e398822e43201983c49ab3',
+    'payload_bytes' => 43,
+    'title_characters' => 2,
+    'text_characters' => 2,
+    'recovered_by_retry' => true,
+], 'Diagnostic logs must preserve every approved value from the last failed attempt');
+deliveryCheck(($events[2]['attempt_http_statuses'] ?? null) === [500, 200]
+    && ($events[2]['provider_code'] ?? null) === 'E500',
+    'DeliveryApplication must pass webhook diagnostics to the operational log');
+deliveryCheck(($events[3]['attempt_http_statuses'] ?? null) === [400]
+    && ($events[3]['provider_code'] ?? null) === 'E400',
+    'ErrorReporter must pass error-webhook diagnostics to the operational log');
+foreach ([
+    'ADDRESS_MARKER@example.invalid', 'SUBJECT_MARKER', 'MAIL_BODY_MARKER', 'ATTACHMENT_MARKER.txt',
+    'secret-placeholder', 'test-placeholder', 'EXCEPTION_MESSAGE_MARKER',
+    'RESPONSE_BODY_MARKER', 'REPORTER_RESPONSE_BODY_MARKER',
+    '{"code":"E500","description":"temporary failure"',
+] as $secret) {
+    deliveryCheck(!str_contains((string) $logs, $secret),
+        'Operational diagnostics must omit mail, webhook, exception, and raw response secrets');
 }
+deliveryCheck((fileperms($logPath) & 0777) === 0600, 'New operational log must be mode 0600');
+
+$loggerBoundaryPath = $logDirectory . '/diagnostic-boundaries.jsonl';
+$loggerBoundary = new OperationalLogger($loggerBoundaryPath);
+$loggerBoundaryCases = [
+    ['code-64', str_repeat('c', 64), 'description', 'text/plain', str_repeat('c', 64), 'description', 'text/plain'],
+    ['code-65', str_repeat('c', 65), 'description', 'text/plain', str_repeat('c', 64), 'description', 'text/plain'],
+    ['description-200', 'code', str_repeat('d', 200), 'text/plain', 'code', str_repeat('d', 200), 'text/plain'],
+    ['description-201', 'code', str_repeat('d', 201), 'text/plain', 'code', str_repeat('d', 200), 'text/plain'],
+    ['content-type-100', 'code', 'description', str_repeat('t', 100), 'code', 'description', str_repeat('t', 100)],
+    ['content-type-101', 'code', 'description', str_repeat('t', 101), 'code', 'description', str_repeat('t', 100)],
+    ['C1-controls', "co\u{0085}de", "desc\u{0085}ription", "text/\u{0085}plain", 'code', 'description', 'text/plain'],
+];
+foreach ($loggerBoundaryCases as [$label, $code, $description, $contentType]) {
+    $loggerBoundary->log('failure', str_repeat('6', 64), 'http_error', 400, new WebhookDiagnostic(
+        [new WebhookAttemptDiagnostic(
+            400, $code, $description, 'json', $contentType, 2,
+            'd4735e3a265e16eee03f59718b9b5d03019c07d8b6c51f90da3a666eec13ab35',
+        )],
+        10, 3, 4, false,
+    ));
+}
+$loggerBoundaryEvents = array_map(
+    static fn (string $line): array => json_decode($line, true, 16, JSON_THROW_ON_ERROR),
+    array_values(array_filter(explode("\n", (string) file_get_contents($loggerBoundaryPath)))),
+);
+foreach ($loggerBoundaryCases as $index => [$label, , , , $expectedCode, $expectedDescription, $expectedContentType]) {
+    deliveryCheck(($loggerBoundaryEvents[$index]['provider_code'] ?? null) === $expectedCode,
+        $label . ' must be re-bounded by OperationalLogger');
+    deliveryCheck(($loggerBoundaryEvents[$index]['provider_description'] ?? null) === $expectedDescription,
+        $label . ' description must be re-bounded by OperationalLogger');
+    deliveryCheck(($loggerBoundaryEvents[$index]['response_content_type'] ?? null) === $expectedContentType,
+        $label . ' content type must be re-bounded by OperationalLogger');
+}
+
+$beforeInvalidFormat = (string) file_get_contents($loggerBoundaryPath);
+$invalidFormatDiagnostic = new WebhookDiagnostic(
+    [new WebhookAttemptDiagnostic(
+        400, 'E400', 'invalid parameter', 'xml', 'application/xml', 20,
+        'f5a45a5bb456a9ec2a298f9b7b22c08ec7e8c92a9b7c38b5116f8f396399020a',
+    )],
+    10, 3, 4, false,
+);
+try {
+    $loggerBoundary->log('failure', str_repeat('7', 64), 'http_error', 400, $invalidFormatDiagnostic);
+    throw new RuntimeException('Unapproved response format was accepted');
+} catch (RuntimeException $exception) {
+    deliveryCheck($exception->getMessage() !== 'Unapproved response format was accepted',
+        'OperationalLogger must reject response formats outside its allowlist');
+}
+deliveryCheck((string) file_get_contents($loggerBoundaryPath) === $beforeInvalidFormat,
+    'Rejected response format must not append any part of an event');
+
+$validBodyHash = hash('sha256', 'diagnostic response');
+$strictLoggerCases = [
+    ['unknown-outcome', 'other', 'http_error', 400, null],
+    ['unknown-classification', 'failure', 'not_allowlisted', 400, null],
+    ['status-below-http-range', 'failure', 'http_error', 99, null],
+    ['success-outcome-mismatch', 'success', 'http_error', 500, null],
+    ['ignored-outcome-mismatch', 'ignored', 'http_error', null, null],
+    ['attempt-status-below-range', 'failure', 'http_error', 99, new WebhookDiagnostic(
+        [new WebhookAttemptDiagnostic(99, 'E99', 'server error', 'json', 'application/json', 2, $validBodyHash)],
+        10, 3, 4, false,
+    )],
+    ['negative-response-bytes', 'failure', 'http_error', 500, new WebhookDiagnostic(
+        [new WebhookAttemptDiagnostic(500, 'E500', 'server error', 'json', 'application/json', -1, $validBodyHash)],
+        10, 3, 4, false,
+    )],
+    ['negative-payload-bytes', 'failure', 'http_error', 500, new WebhookDiagnostic(
+        [new WebhookAttemptDiagnostic(500, 'E500', 'server error', 'json', 'application/json', 2, $validBodyHash)],
+        -1, 3, 4, false,
+    )],
+    ['transport-with-metadata', 'failure', 'transport_error', null, new WebhookDiagnostic(
+        [new WebhookAttemptDiagnostic(null, 'secret', null, 'transport_error', null, 0, null)],
+        10, 3, 4, false,
+    )],
+    ['invalid-json-with-provider-code', 'failure', 'http_error', 502, new WebhookDiagnostic(
+        [new WebhookAttemptDiagnostic(502, 'E502', null, 'invalid_json', 'text/plain', 2, $validBodyHash)],
+        10, 3, 4, false,
+    )],
+    ['json-without-body-hash', 'failure', 'http_error', 500, new WebhookDiagnostic(
+        [new WebhookAttemptDiagnostic(500, 'E500', 'server error', 'json', 'application/json', 2, null)],
+        10, 3, 4, false,
+    )],
+    ['recovered-without-retryable-transition', 'success', 'success', 200, new WebhookDiagnostic(
+        [
+            new WebhookAttemptDiagnostic(400, 'E400', 'invalid parameter', 'json', 'application/json', 2, $validBodyHash),
+            new WebhookAttemptDiagnostic(200, 200, 'success', 'json', 'application/json', 2, $validBodyHash),
+        ],
+        10, 3, 4, true,
+    )],
+    ['failure-with-success-tuple', 'failure', 'success', 200, new WebhookDiagnostic(
+        [new WebhookAttemptDiagnostic(200, 200, 'success', 'json', 'application/json', 2, $validBodyHash)],
+        10, 3, 4, false,
+    )],
+    ['event-status-does-not-match-last-attempt', 'failure', 'http_error', 500, new WebhookDiagnostic(
+        [new WebhookAttemptDiagnostic(400, 'E400', 'server error', 'json', 'application/json', 2, $validBodyHash)],
+        10, 3, 4, false,
+    )],
+    ['transport-before-later-http-attempt', 'failure', 'http_error', 500, new WebhookDiagnostic(
+        [
+            new WebhookAttemptDiagnostic(null, null, null, 'transport_error', null, 0, null),
+            new WebhookAttemptDiagnostic(500, 'E500', 'server error', 'json', 'application/json', 2, $validBodyHash),
+        ],
+        10, 3, 4, false,
+    )],
+];
+foreach ($strictLoggerCases as [$label, $outcome, $classification, $status, $diagnostic]) {
+    $beforeRejectedDiagnostic = (string) file_get_contents($loggerBoundaryPath);
+    try {
+        $loggerBoundary->log(
+            $outcome, str_repeat('8', 64), $classification, $status, $diagnostic,
+        );
+        throw new RuntimeException($label . ' was accepted');
+    } catch (RuntimeException $exception) {
+        deliveryCheck($exception->getMessage() !== $label . ' was accepted',
+            $label . ' must be rejected by the operational logging boundary');
+    }
+    deliveryCheck((string) file_get_contents($loggerBoundaryPath) === $beforeRejectedDiagnostic,
+        $label . ' must not append any event bytes');
+}
+
+$fixedLogClock = static fn (): DateTimeImmutable => new DateTimeImmutable('2026-07-31T00:00:00+00:00');
+$templateLogPath = $logDirectory . '/bounded-template.jsonl';
+(new OperationalLogger($templateLogPath, $fixedLogClock))->log(
+    'success', str_repeat('a', 64), 'success', 200,
+);
+$boundedNewLine = (string) file_get_contents($templateLogPath);
+$boundedMaximum = 240 * 1024;
+$exactExistingBytes = $boundedMaximum - strlen($boundedNewLine);
+$objectOverhead = strlen("{\"padding\":\"\"}\n");
+$exactExistingLine = json_encode([
+    'padding' => str_repeat('x', $exactExistingBytes - $objectOverhead),
+], JSON_THROW_ON_ERROR) . "\n";
+deliveryCheck(strlen($exactExistingLine) === $exactExistingBytes,
+    'Exact bounded-log fixture must have its hand-calculated byte length');
+$exactBoundaryPath = $logDirectory . '/bounded-exact.jsonl';
+file_put_contents($exactBoundaryPath, $exactExistingLine);
+chmod($exactBoundaryPath, 0600);
+(new OperationalLogger($exactBoundaryPath, $fixedLogClock))->log(
+    'success', str_repeat('a', 64), 'success', 200,
+);
+deliveryCheck(filesize($exactBoundaryPath) === $boundedMaximum,
+    'Operational log may reach but never exceed the 240 KiB server bound');
+
+$partialTailPath = $logDirectory . '/partial-tail.jsonl';
+$partialPriorHash = str_repeat('6', 64);
+$partialNewHash = str_repeat('7', 64);
+$partialPriorLine = json_encode([
+    'message_id_hash' => $partialPriorHash,
+], JSON_THROW_ON_ERROR) . "\n";
+file_put_contents($partialTailPath, $partialPriorLine . '{"torn":');
+chmod($partialTailPath, 0600);
+(new OperationalLogger($partialTailPath, $fixedLogClock))->log(
+    'success', $partialNewHash, 'success', 200,
+);
+$recoveredPartialBytes = (string) file_get_contents($partialTailPath);
+deliveryCheck(str_contains($recoveredPartialBytes, $partialPriorHash)
+    && str_contains($recoveredPartialBytes, $partialNewHash)
+    && !str_contains($recoveredPartialBytes, 'torn'),
+    'A partial tail below the size bound must force recovery compaction before appending');
+foreach (array_filter(explode("\n", $recoveredPartialBytes)) as $recoveredPartialLine) {
+    deliveryCheck(json_decode($recoveredPartialLine, false, 16, JSON_THROW_ON_ERROR) instanceof stdClass,
+        'Partial-tail recovery must leave only complete independent JSON-object lines');
+}
+
+$retainedHash = str_repeat('b', 64);
+$newHash = str_repeat('c', 64);
+$seedLines = [];
+for ($index = 0; $index < 2200; ++$index) {
+    $seedLines[] = json_encode([
+        'timestamp' => '2026-07-30T00:00:00+00:00',
+        'outcome' => 'failure',
+        'message_id_hash' => hash('sha256', 'seed-' . $index),
+        'classification' => 'http_error',
+        'http_status' => 500,
+    ], JSON_THROW_ON_ERROR);
+}
+$seedLines[] = json_encode([
+    'timestamp' => '2026-07-30T00:00:01+00:00',
+    'outcome' => 'failure',
+    'message_id_hash' => $retainedHash,
+    'classification' => 'http_error',
+    'http_status' => 500,
+], JSON_THROW_ON_ERROR);
+$oversizedSeed = implode("\n", $seedLines) . "\nnot-json\n[]\n42\n{\"partial\":";
+deliveryCheck(strlen($oversizedSeed) > $boundedMaximum,
+    'Compaction fixture must begin above the server log bound');
+$compactionPath = $logDirectory . '/bounded-compaction.jsonl';
+file_put_contents($compactionPath, $oversizedSeed);
+chmod($compactionPath, 0600);
+$beforeCompaction = lstat($compactionPath);
+(new OperationalLogger($compactionPath, $fixedLogClock))->log(
+    'success', $newHash, 'success', 200,
+);
+$afterCompaction = lstat($compactionPath);
+$compactedBytes = (string) file_get_contents($compactionPath);
+deliveryCheck(strlen($compactedBytes) <= $boundedMaximum && str_ends_with($compactedBytes, "\n"),
+    'Compacted operational log must be bounded and newline terminated');
+deliveryCheck(str_contains($compactedBytes, $retainedHash) && str_contains($compactedBytes, $newHash),
+    'Compaction must retain the latest existing valid event and the new event');
+deliveryCheck(!str_contains($compactedBytes, 'not-json') && !str_contains($compactedBytes, 'partial'),
+    'Compaction must discard malformed and partial tail records');
+foreach (array_filter(explode("\n", $compactedBytes)) as $compactedLine) {
+    deliveryCheck(json_decode($compactedLine, false, 16, JSON_THROW_ON_ERROR) instanceof stdClass,
+        'Compaction must retain only complete UTF-8 JSON object lines');
+}
+deliveryCheck(is_array($beforeCompaction) && is_array($afterCompaction)
+    && $beforeCompaction['dev'] === $afterCompaction['dev']
+    && $beforeCompaction['ino'] !== $afterCompaction['ino']
+    && ($afterCompaction['mode'] & 0777) === 0600
+    && $afterCompaction['uid'] === posix_geteuid() && $afterCompaction['nlink'] === 1,
+    'Compaction must atomically replace the inode with an owner-only one-link file');
+
+$oversizedEventPath = $logDirectory . '/oversized-event.jsonl';
+file_put_contents($oversizedEventPath, "UNCHANGED_OVERSIZED_EVENT\n");
+chmod($oversizedEventPath, 0600);
+$largeAttempt = new WebhookAttemptDiagnostic(
+    500, 'E500', 'server error', 'json', 'application/json', 2, $validBodyHash,
+);
+try {
+    (new OperationalLogger($oversizedEventPath, $fixedLogClock))->log(
+        'failure', str_repeat('d', 64), 'http_error', 500,
+        new WebhookDiagnostic(array_fill(0, 31_000, $largeAttempt), 10, 3, 4, false),
+    );
+    throw new RuntimeException('Oversized operational event was accepted');
+} catch (RuntimeException $exception) {
+    deliveryCheck($exception->getMessage() !== 'Oversized operational event was accepted',
+        'A single event above 120 KiB must be rejected before mutation');
+}
+deliveryCheck((string) file_get_contents($oversizedEventPath) === "UNCHANGED_OVERSIZED_EVENT\n",
+    'Rejected oversized event must leave the existing log unchanged');
+
+$faultPath = $logDirectory . '/bounded-fault.jsonl';
+file_put_contents($faultPath, $oversizedSeed);
+chmod($faultPath, 0600);
+$beforeFault = lstat($faultPath);
+$beforeFaultBytes = (string) file_get_contents($faultPath);
+try {
+    (new OperationalLogger(
+        $faultPath,
+        $fixedLogClock,
+        null,
+        static fn (): never => throw new RuntimeException('Injected before truncate'),
+    ))->log('success', str_repeat('e', 64), 'success', 200);
+    throw new RuntimeException('Compaction fault was not propagated');
+} catch (RuntimeException $exception) {
+    deliveryCheck($exception->getMessage() !== 'Compaction fault was not propagated',
+        'Injected compaction failure must become a fixed logging failure');
+}
+$afterFault = lstat($faultPath);
+$faultBytes = (string) file_get_contents($faultPath);
+deliveryCheck(is_array($beforeFault) && is_array($afterFault)
+    && $beforeFault['size'] === $afterFault['size']
+    && $beforeFault['ino'] === $afterFault['ino']
+    && hash_equals($beforeFaultBytes, $faultBytes),
+    'Failure before atomic replacement must preserve every byte and the inode of the old log');
+
+$wrongModeLockPath = $logDirectory . '/wrong-mode-lock.jsonl';
+file_put_contents($wrongModeLockPath . '.lock', 'lock');
+chmod($wrongModeLockPath . '.lock', 0644);
+try {
+    (new OperationalLogger($wrongModeLockPath, $fixedLogClock))->log(
+        'success', str_repeat('1', 64), 'success', 200,
+    );
+    throw new RuntimeException('Wrong-mode sidecar lock was accepted');
+} catch (RuntimeException $exception) {
+    deliveryCheck($exception->getMessage() !== 'Wrong-mode sidecar lock was accepted',
+        'The fixed sidecar lock must be a mode-0600 regular file');
+}
+deliveryCheck(!file_exists($wrongModeLockPath),
+    'Rejecting a wrong-mode sidecar lock must happen before creating the operational log');
+
+$lockTargetPath = $logDirectory . '/lock-target';
+file_put_contents($lockTargetPath, 'UNCHANGED_LOCK_TARGET');
+chmod($lockTargetPath, 0600);
+$symlinkLockPath = $logDirectory . '/symlink-lock.jsonl';
+symlink($lockTargetPath, $symlinkLockPath . '.lock');
+try {
+    (new OperationalLogger($symlinkLockPath, $fixedLogClock))->log(
+        'success', str_repeat('2', 64), 'success', 200,
+    );
+    throw new RuntimeException('Symlink sidecar lock was accepted');
+} catch (RuntimeException $exception) {
+    deliveryCheck($exception->getMessage() !== 'Symlink sidecar lock was accepted',
+        'The fixed sidecar lock must reject symlinks');
+}
+deliveryCheck((string) file_get_contents($lockTargetPath) === 'UNCHANGED_LOCK_TARGET'
+    && !file_exists($symlinkLockPath),
+    'Rejecting a symlink sidecar lock must not touch its target or create the operational log');
+
+$tempModeFaultPath = $logDirectory . '/temp-mode-fault.jsonl';
+file_put_contents($tempModeFaultPath, $oversizedSeed);
+chmod($tempModeFaultPath, 0600);
+$tempModeFaultBefore = (string) file_get_contents($tempModeFaultPath);
+try {
+    (new OperationalLogger(
+        $tempModeFaultPath,
+        $fixedLogClock,
+        null,
+        null,
+        static function (string $phase, ?string $temporaryPath): void {
+            if ($phase === 'temp_created' && is_string($temporaryPath)) {
+                chmod($temporaryPath, 0644);
+            }
+        },
+    ))->log('success', str_repeat('3', 64), 'success', 200);
+    throw new RuntimeException('Wrong-mode temporary file was accepted');
+} catch (RuntimeException $exception) {
+    deliveryCheck($exception->getMessage() !== 'Wrong-mode temporary file was accepted',
+        'Atomic compaction must reject a temporary file whose mode changes from 0600');
+}
+deliveryCheck(hash_equals($tempModeFaultBefore, (string) file_get_contents($tempModeFaultPath)),
+    'Wrong-mode temporary-file rejection must leave the old log unchanged');
+
+$tempSymlinkFaultPath = $logDirectory . '/temp-symlink-fault.jsonl';
+$tempSymlinkTarget = $logDirectory . '/temp-symlink-target';
+file_put_contents($tempSymlinkFaultPath, $oversizedSeed);
+chmod($tempSymlinkFaultPath, 0600);
+file_put_contents($tempSymlinkTarget, 'UNCHANGED_TEMP_SYMLINK_TARGET');
+chmod($tempSymlinkTarget, 0600);
+$tempSymlinkBefore = (string) file_get_contents($tempSymlinkFaultPath);
+try {
+    (new OperationalLogger(
+        $tempSymlinkFaultPath,
+        $fixedLogClock,
+        null,
+        null,
+        static function (string $phase, ?string $temporaryPath) use ($tempSymlinkTarget): void {
+            if ($phase === 'temp_created' && is_string($temporaryPath)) {
+                unlink($temporaryPath);
+                symlink($tempSymlinkTarget, $temporaryPath);
+            }
+        },
+    ))->log('success', str_repeat('a', 64), 'success', 200);
+    throw new RuntimeException('Symlink temporary path was accepted');
+} catch (RuntimeException $exception) {
+    deliveryCheck($exception->getMessage() !== 'Symlink temporary path was accepted',
+        'Atomic compaction must reject replacement of its temporary name by a symlink');
+}
+deliveryCheck(hash_equals($tempSymlinkBefore, (string) file_get_contents($tempSymlinkFaultPath))
+    && (string) file_get_contents($tempSymlinkTarget) === 'UNCHANGED_TEMP_SYMLINK_TARGET',
+    'Temporary symlink rejection must preserve both the old log and symlink target');
+
+$shortWritePath = $logDirectory . '/short-write-fault.jsonl';
+file_put_contents($shortWritePath, $oversizedSeed);
+chmod($shortWritePath, 0600);
+$shortWriteBefore = (string) file_get_contents($shortWritePath);
+$shortWriteCalls = 0;
+try {
+    (new OperationalLogger(
+        $shortWritePath,
+        $fixedLogClock,
+        null,
+        null,
+        null,
+        static function ($handle, string $bytes) use (&$shortWriteCalls): int|false {
+            ++$shortWriteCalls;
+            if ($shortWriteCalls === 1) {
+                return fwrite($handle, substr($bytes, 0, 17));
+            }
+            return false;
+        },
+    ))->log('success', str_repeat('4', 64), 'success', 200);
+    throw new RuntimeException('Partial temporary write was accepted');
+} catch (RuntimeException $exception) {
+    deliveryCheck($exception->getMessage() !== 'Partial temporary write was accepted',
+        'A short then failed temporary write must abort atomic compaction');
+}
+deliveryCheck($shortWriteCalls >= 2
+    && hash_equals($shortWriteBefore, (string) file_get_contents($shortWritePath)),
+    'A partial temporary write must leave the old log unchanged');
+
+$flushFaultPath = $logDirectory . '/flush-fault.jsonl';
+file_put_contents($flushFaultPath, $oversizedSeed);
+chmod($flushFaultPath, 0600);
+$flushFaultBefore = (string) file_get_contents($flushFaultPath);
+try {
+    (new OperationalLogger(
+        $flushFaultPath,
+        $fixedLogClock,
+        null,
+        null,
+        static function (string $phase): void {
+            if ($phase === 'before_temp_flush') {
+                throw new RuntimeException('Injected flush fault');
+            }
+        },
+    ))->log('success', str_repeat('5', 64), 'success', 200);
+    throw new RuntimeException('Temporary flush fault was accepted');
+} catch (RuntimeException $exception) {
+    deliveryCheck($exception->getMessage() !== 'Temporary flush fault was accepted',
+        'A temporary flush fault must abort before atomic replacement');
+}
+deliveryCheck(hash_equals($flushFaultBefore, (string) file_get_contents($flushFaultPath)),
+    'A temporary flush fault must leave the old log unchanged');
+
+$afterRenameFaultPath = $logDirectory . '/after-rename-fault.jsonl';
+file_put_contents($afterRenameFaultPath, $oversizedSeed);
+chmod($afterRenameFaultPath, 0600);
+$afterRenameHash = str_repeat('f', 64);
+try {
+    (new OperationalLogger(
+        $afterRenameFaultPath,
+        $fixedLogClock,
+        null,
+        null,
+        static function (string $phase): void {
+            if ($phase === 'after_rename') {
+                throw new RuntimeException('Injected post-rename interruption');
+            }
+        },
+    ))->log('success', $afterRenameHash, 'success', 200);
+} catch (RuntimeException) {
+}
+$afterRenameBytes = (string) file_get_contents($afterRenameFaultPath);
+deliveryCheck(str_ends_with($afterRenameBytes, "\n")
+    && str_contains($afterRenameBytes, $afterRenameHash)
+    && !str_contains($afterRenameBytes, 'partial'),
+    'An interruption after rename must expose the complete new JSONL file, never a torn replacement');
+foreach (array_filter(explode("\n", $afterRenameBytes)) as $afterRenameLine) {
+    deliveryCheck(json_decode($afterRenameLine, false, 16, JSON_THROW_ON_ERROR) instanceof stdClass,
+        'Every line visible after a post-rename interruption must remain a complete JSON object');
+}
+
+$restartPath = $logDirectory . '/restart-after-fault.jsonl';
+file_put_contents($restartPath, $partialPriorLine . '{"interrupted":');
+chmod($restartPath, 0600);
+try {
+    (new OperationalLogger(
+        $restartPath,
+        $fixedLogClock,
+        null,
+        null,
+        static function (string $phase): void {
+            if ($phase === 'before_rename') {
+                throw new RuntimeException('Injected rename fault');
+            }
+        },
+    ))->log('success', str_repeat('8', 64), 'success', 200);
+} catch (RuntimeException) {
+}
+(new OperationalLogger($restartPath, $fixedLogClock))->log(
+    'success', str_repeat('9', 64), 'success', 200,
+);
+$restartBytes = (string) file_get_contents($restartPath);
+deliveryCheck(!str_contains($restartBytes, 'interrupted')
+    && str_contains($restartBytes, str_repeat('9', 64)),
+    'A new logger process must recover a pre-rename partial-tail failure into complete JSONL');
+
+if (function_exists('pcntl_fork') && function_exists('pcntl_waitpid')) {
+    $parallelPath = $logDirectory . '/parallel-writers.jsonl';
+    file_put_contents($parallelPath, $partialPriorLine . '{"interrupted":');
+    chmod($parallelPath, 0600);
+    $children = [];
+    for ($worker = 0; $worker < 2; ++$worker) {
+        $child = pcntl_fork();
+        if ($child === 0) {
+            try {
+                for ($entry = 0; $entry < 8; ++$entry) {
+                    (new OperationalLogger($parallelPath, $fixedLogClock))->log(
+                        'success', hash('sha256', 'parallel-' . $worker . '-' . $entry), 'success', 200,
+                    );
+                }
+                exit(0);
+            } catch (Throwable) {
+                exit(1);
+            }
+        }
+        deliveryCheck(is_int($child) && $child > 0, 'Parallel writer process must start');
+        $children[] = $child;
+    }
+    foreach ($children as $child) {
+        $status = 0;
+        deliveryCheck(pcntl_waitpid($child, $status) === $child && pcntl_wifexited($status)
+            && pcntl_wexitstatus($status) === 0, 'Parallel writer process must complete successfully');
+    }
+    $parallelLines = array_values(array_filter(explode("\n", (string) file_get_contents($parallelPath))));
+    deliveryCheck(count($parallelLines) === 17,
+        'Fixed sidecar locking must retain the prior event and all 16 parallel appends exactly once');
+    foreach ($parallelLines as $parallelLine) {
+        deliveryCheck(json_decode($parallelLine, false, 16, JSON_THROW_ON_ERROR) instanceof stdClass,
+            'Parallel writers must leave only complete JSON-object lines');
+    }
+}
+
+$wrongOwnerPath = $logDirectory . '/wrong-owner.jsonl';
+file_put_contents($wrongOwnerPath, "UNCHANGED_WRONG_OWNER\n");
+chmod($wrongOwnerPath, 0600);
+$wrongOwnerLogger = new OperationalLogger(
+    $wrongOwnerPath,
+    null,
+    static fn (): int => posix_geteuid() + 1,
+);
+try {
+    $wrongOwnerLogger->log('success', str_repeat('8', 64), 'success', 200);
+    throw new RuntimeException('Wrong-owner operational log was accepted');
+} catch (RuntimeException $exception) {
+    deliveryCheck($exception->getMessage() !== 'Wrong-owner operational log was accepted',
+        'OperationalLogger must compare stat ownership with the effective UID resolver');
+}
+deliveryCheck((string) file_get_contents($wrongOwnerPath) === "UNCHANGED_WRONG_OWNER\n"
+    && (fileperms($wrongOwnerPath) & 0777) === 0600,
+    'Rejected wrong-owner log must not be modified or chmodded');
+
+$badModePath = $logDirectory . '/bad-mode.jsonl';
+file_put_contents($badModePath, "UNCHANGED_BAD_MODE\n");
+chmod($badModePath, 0644);
+try {
+    (new OperationalLogger($badModePath))->log('success', str_repeat('2', 64), 'success', 200);
+    throw new RuntimeException('Mode-0644 operational log was accepted');
+} catch (RuntimeException $exception) {
+    deliveryCheck($exception->getMessage() !== 'Mode-0644 operational log was accepted',
+        'Existing mode-0644 operational log must be rejected');
+}
+deliveryCheck((string) file_get_contents($badModePath) === "UNCHANGED_BAD_MODE\n"
+    && (fileperms($badModePath) & 0777) === 0644,
+    'Rejected mode-0644 log must not be modified or chmodded');
+
+$outsideDirectory = sys_get_temp_dir() . '/delivery-log-target-' . bin2hex(random_bytes(8));
+mkdir($outsideDirectory, 0700);
+$outsideTarget = $outsideDirectory . '/outside.jsonl';
+file_put_contents($outsideTarget, "UNCHANGED_SYMLINK_TARGET\n");
+chmod($outsideTarget, 0600);
+$symlinkPath = $logDirectory . '/symlink.jsonl';
+symlink($outsideTarget, $symlinkPath);
+try {
+    (new OperationalLogger($symlinkPath))->log('success', str_repeat('3', 64), 'success', 200);
+    throw new RuntimeException('Symlink operational log was accepted');
+} catch (RuntimeException $exception) {
+    deliveryCheck($exception->getMessage() !== 'Symlink operational log was accepted',
+        'Symlink operational log must be rejected');
+}
+deliveryCheck((string) file_get_contents($outsideTarget) === "UNCHANGED_SYMLINK_TARGET\n"
+    && (fileperms($outsideTarget) & 0777) === 0600,
+    'Rejected symlink must not alter or chmod its external target');
+
+$openParent = $logDirectory . '/open-parent';
+mkdir($openParent, 0755);
+$openParentLog = $openParent . '/operational.jsonl';
+try {
+    (new OperationalLogger($openParentLog))->log('success', str_repeat('4', 64), 'success', 200);
+    throw new RuntimeException('Operational log below a non-0700 parent was accepted');
+} catch (RuntimeException $exception) {
+    deliveryCheck($exception->getMessage() !== 'Operational log below a non-0700 parent was accepted',
+        'Operational log parent must be mode 0700');
+}
+deliveryCheck(!file_exists($openParentLog), 'Rejected non-private parent must not receive a log file');
+
+$publicLogDirectory = $logDirectory . '/public_html';
+mkdir($publicLogDirectory, 0700);
+$publicLogPath = $publicLogDirectory . '/operational.jsonl';
+try {
+    (new OperationalLogger($publicLogPath))->log('success', str_repeat('5', 64), 'success', 200);
+    throw new RuntimeException('Operational log below public_html was accepted');
+} catch (RuntimeException $exception) {
+    deliveryCheck($exception->getMessage() !== 'Operational log below public_html was accepted',
+        'Operational log path must remain outside public_html');
+}
+deliveryCheck(!file_exists($publicLogPath), 'Rejected public path must not receive a log file');
+
 unlink($logPath);
+unlink($echoLogPath);
+unlink($codeEchoLogPath);
+unlink($loggerBoundaryPath);
+unlink($templateLogPath);
+unlink($exactBoundaryPath);
+unlink($partialTailPath);
+unlink($compactionPath);
+unlink($oversizedEventPath);
+unlink($faultPath);
+unlink($wrongModeLockPath . '.lock');
+unlink($symlinkLockPath . '.lock');
+unlink($lockTargetPath);
+unlink($tempModeFaultPath);
+unlink($tempSymlinkFaultPath);
+unlink($tempSymlinkTarget);
+unlink($shortWritePath);
+unlink($flushFaultPath);
+unlink($afterRenameFaultPath);
+unlink($restartPath);
+if (isset($parallelPath) && file_exists($parallelPath)) {
+    unlink($parallelPath);
+}
+unlink($wrongOwnerPath);
+unlink($badModePath);
+unlink($symlinkPath);
+unlink($outsideTarget);
+foreach (glob($logDirectory . '/*.lock') ?: [] as $operationalLockPath) {
+    unlink($operationalLockPath);
+}
+foreach (glob($logDirectory . '/.*.tmp.*') ?: [] as $operationalTemporaryPath) {
+    unlink($operationalTemporaryPath);
+}
+rmdir($outsideDirectory);
+rmdir($openParent);
+rmdir($publicLogDirectory);
+rmdir($logDirectory);
 
 foreach ([0, -1, 31] as $invalidSoftCap) {
     try {
@@ -732,9 +1650,15 @@ deliveryCheck(count($dedupRequests) === 7, 'Raw RFC5322 fallback must treat tran
 $retryCalls = 0;
 $retryWebhook = new WebhookClient('https://webhook.worksmobile.com/message/test', static function () use (&$retryCalls): array {
     ++$retryCalls;
-    return $retryCalls === 1 ? response(500, 'server error') : response(200, 'success');
-});
-$retryReporter = new ErrorReporter($retryWebhook, $dedupLogger);
+    return $retryCalls <= 2 ? response(500, 'server error') : response(200, 'success');
+}, 32_768, static function (): void {});
+$retryReporter = new ErrorReporter(
+    new WebhookClient(
+        'https://webhook.worksmobile.com/message/test',
+        static fn (): array => response(200, 'success'),
+    ),
+    $dedupLogger,
+);
 $retryApplication = new DeliveryApplication($retryWebhook, $retryReporter, $dedupLogger, null, $appDedup);
 $retryRaw = str_replace('<same@example.invalid>', '<retry@example.invalid>', $sameRaw);
 $retryApplication->deliver($retryRaw);
@@ -748,13 +1672,13 @@ $throwingReporter = new ErrorReporter(
 $reporterDeliveryCalls = 0;
 $reporterDeliveryWebhook = new WebhookClient('https://webhook.worksmobile.com/message/test', static function () use (&$reporterDeliveryCalls): array {
     ++$reporterDeliveryCalls;
-    return $reporterDeliveryCalls === 1 ? response(500, 'server error') : response(200, 'success');
-});
+    return $reporterDeliveryCalls <= 2 ? response(500, 'server error') : response(200, 'success');
+}, 32_768, static function (): void {});
 $reporterRetryRaw = str_replace('<same@example.invalid>', '<reporter-retry@example.invalid>', $sameRaw);
 $reporterRetryApplication = new DeliveryApplication($reporterDeliveryWebhook, $throwingReporter, $dedupLogger, null, $appDedup);
 $reporterRetryApplication->deliver($reporterRetryRaw);
 $reporterRetryApplication->deliver($reporterRetryRaw);
-deliveryCheck($reporterDeliveryCalls === 2, 'Reporter failure must not prevent reservation release and later retry');
+deliveryCheck($reporterDeliveryCalls === 3, 'Reporter failure must not prevent reservation release and later retry');
 
 $failedStorePath = $appDedupDirectory . '/missing/claims.json';
 $failedStore = new DeliveryDeduplicator($failedStorePath);
@@ -785,12 +1709,16 @@ $reportFailureWebhook = new WebhookClient(
     static function (): void { throw new RuntimeException('reporter sleeper failed'); },
 );
 $reportFailureReporter = new ErrorReporter($reportFailureWebhook, $brokenLogger);
-$reportFailureLog = tempnam(sys_get_temp_dir(), 'report-failure-log-');
-deliveryCheck(is_string($reportFailureLog), 'Reporter failure test log must be created');
+$reportFailureDirectory = sys_get_temp_dir() . '/report-failure-log-' . bin2hex(random_bytes(8));
+mkdir($reportFailureDirectory, 0700);
+$reportFailureLog = $reportFailureDirectory . '/operational.jsonl';
+file_put_contents($reportFailureLog, '');
+chmod($reportFailureLog, 0600);
 (new DeliveryApplication($reportFailureWebhook, $reportFailureReporter, new OperationalLogger($reportFailureLog)))
     ->deliver(file_get_contents(dirname(__DIR__) . '/fixtures/plain.eml') ?: '');
 deliveryCheck($reportFailureCalls === 2, 'Reporter failure must be swallowed without retrying the reporter');
 unlink($reportFailureLog);
+rmdir($reportFailureDirectory);
 
 $forcedRaw = "From: sender@example.invalid\r\nTo: target@example.invalid\r\nSubject: [Error Test {$testToken}]\r\nMessage-ID: <forced@example.invalid>\r\n\r\nSecret body";
 

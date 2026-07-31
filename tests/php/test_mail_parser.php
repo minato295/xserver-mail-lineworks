@@ -66,24 +66,32 @@ check(str_contains(QuoteTrimmer::html('<div data-example="<blockquote>">属性�
 check(!str_contains(QuoteTrimmer::html('<div>新規</div><blockquote>引用</blockquote><div>続き</div>'), '引用'), 'HTML blockquote must be removed');
 check(!str_contains(QuoteTrimmer::html('<div>新規</div><div class="foo GMAIL_QUOTE bar">引用</div><div>続き</div>'), '引用'), 'Whitespace-delimited gmail_quote class tokens must be removed case-insensitively');
 
-$measureMalformedQuote = static function (int $repetitions): array {
+$cpuMicros = static function (): int {
+    $usage = getrusage();
+
+    return (($usage['ru_utime.tv_sec'] + $usage['ru_stime.tv_sec']) * 1_000_000)
+        + $usage['ru_utime.tv_usec'] + $usage['ru_stime.tv_usec'];
+};
+$measureMalformedQuote = static function (int $repetitions) use ($cpuMicros): array {
     $html = '<blockquote>' . str_repeat('<a "', $repetitions) . '</blockquote><div>KEEP_AFTER_MALFORMED_QUOTE</div>';
-    $fastestNanos = PHP_INT_MAX;
+    // Warm caches, then measure CPU time so scheduler pauses do not distort the scaling ratio.
+    QuoteTrimmer::html($html);
+    $fastestMicros = PHP_INT_MAX;
     $trimmed = '';
-    for ($attempt = 0; $attempt < 3; ++$attempt) {
-        $started = hrtime(true);
+    for ($attempt = 0; $attempt < 5; ++$attempt) {
+        $started = $cpuMicros();
         $trimmed = QuoteTrimmer::html($html);
-        $fastestNanos = min($fastestNanos, hrtime(true) - $started);
+        $fastestMicros = min($fastestMicros, $cpuMicros() - $started);
     }
 
-    return [$trimmed, $fastestNanos];
+    return [$trimmed, $fastestMicros];
 };
-[$malformedSmallResult, $malformedSmallNanos] = $measureMalformedQuote(20_000);
-[$malformedLargeResult, $malformedLargeNanos] = $measureMalformedQuote(40_000);
+[$malformedSmallResult, $malformedSmallMicros] = $measureMalformedQuote(20_000);
+[$malformedLargeResult, $malformedLargeMicros] = $measureMalformedQuote(40_000);
 check(
     str_contains($malformedSmallResult, 'KEEP_AFTER_MALFORMED_QUOTE')
         && str_contains($malformedLargeResult, 'KEEP_AFTER_MALFORMED_QUOTE')
-        && $malformedLargeNanos <= max(1, $malformedSmallNanos) * 3.5,
+        && $malformedLargeMicros <= max(1, $malformedSmallMicros) * 3.5,
     'Malformed quote HTML must retain following text with approximately linear scaling',
 );
 

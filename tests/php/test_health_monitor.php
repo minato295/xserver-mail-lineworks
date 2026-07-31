@@ -21,6 +21,11 @@ function healthCheck(bool $condition, string $message): void
     }
 }
 
+$healthLogFixtureDirectory = sys_get_temp_dir() . '/health-log-' . bin2hex(random_bytes(8));
+mkdir($healthLogFixtureDirectory, 0700);
+$healthLogFixtureDirectory = realpath($healthLogFixtureDirectory);
+healthCheck(is_string($healthLogFixtureDirectory), 'Health log fixture directory must resolve');
+
 final class FakePrivateStateFilesystem implements PrivateStateFilesystem
 {
     /** @var array<string,string> */
@@ -150,9 +155,10 @@ function fakeMonitor(
     ?callable $utcClock = null,
 ): array
 {
+    global $healthLogFixtureDirectory;
     $filesystem ??= new FakePrivateStateFilesystem();
     $adapter ??= new HealthSendmailAdapter();
-    $log = tempnam(sys_get_temp_dir(), 'health-log-');
+    $log = tempnam($healthLogFixtureDirectory, 'operational-');
     healthCheck(is_string($log), 'Health log fixture must exist');
     $path = '/private-test/delivery-health.json';
     $fixtureHmacKey = 'HEALTH_MONITOR_HMAC_KEY_7f9c2d4a';
@@ -1073,5 +1079,9 @@ healthCheck($recursiveFailureCaught && $recursiveReuse === 'sequential-success' 
 unlink($recursiveLock);
 rmdir($recursiveDirectory);
 rmdir($recursiveHome);
+foreach (glob($healthLogFixtureDirectory . '/*.lock') ?: [] as $operationalLockPath) {
+    unlink($operationalLockPath);
+}
+rmdir($healthLogFixtureDirectory);
 
 fwrite(STDOUT, "PASS: delivery health state machine and Japanese alert contract\n");
