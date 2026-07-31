@@ -414,7 +414,7 @@ $applicationResponses = [
     response(200, 'success'),
 ];
 $applicationWebhook = new WebhookClient(
-    'https://webhook.worksmobile.com/message/WEBHOOK_TOKEN_MARKER',
+    'https://webhook.worksmobile.com/message/secret-placeholder',
     static function () use (&$applicationResponses): array { return array_shift($applicationResponses); },
     256,
     static function (): void {},
@@ -431,7 +431,7 @@ $applicationReporter = new ErrorReporter($applicationWebhook, $logger);
 
 $reporter = new ErrorReporter(
     new WebhookClient(
-        'https://webhook.worksmobile.com/message/REPORTER_WEBHOOK_TOKEN_MARKER',
+        'https://webhook.worksmobile.com/message/test-placeholder',
         static fn (): array => [
             'status' => 400,
             'body' => '{"code":"E400","description":"invalid parameter","raw":"REPORTER_RESPONSE_BODY_MARKER"}',
@@ -480,7 +480,7 @@ deliveryCheck(($events[3]['attempt_http_statuses'] ?? null) === [400]
     'ErrorReporter must pass error-webhook diagnostics to the operational log');
 foreach ([
     'ADDRESS_MARKER@example.invalid', 'SUBJECT_MARKER', 'MAIL_BODY_MARKER', 'ATTACHMENT_MARKER.txt',
-    'WEBHOOK_TOKEN_MARKER', 'REPORTER_WEBHOOK_TOKEN_MARKER', 'EXCEPTION_MESSAGE_MARKER',
+    'secret-placeholder', 'test-placeholder', 'EXCEPTION_MESSAGE_MARKER',
     'RESPONSE_BODY_MARKER', 'REPORTER_RESPONSE_BODY_MARKER',
     '{"code":"E500","description":"temporary failure"',
 ] as $secret) {
