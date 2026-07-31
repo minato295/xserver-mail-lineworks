@@ -297,6 +297,28 @@ deliveryCheck($diagnosticResult->diagnostic->recoveredByRetry, 'Retry recovery m
 deliveryCheck($diagnosticResult->diagnostic->attempts[0]->providerCode === 'E500', 'Provider code must be preserved safely');
 deliveryCheck($diagnosticResult->diagnostic->attempts[0]->providerDescription === 'temporary failure', 'Controls must be removed');
 
+foreach ([
+    ['provider code at 64', str_repeat('c', 64), 'description', 'text/plain', str_repeat('c', 64), 'description', 'text/plain'],
+    ['provider code at 65', str_repeat('c', 65), 'description', 'text/plain', str_repeat('c', 64), 'description', 'text/plain'],
+    ['provider description at 200', 'code', str_repeat('d', 200), 'text/plain', 'code', str_repeat('d', 200), 'text/plain'],
+    ['provider description at 201', 'code', str_repeat('d', 201), 'text/plain', 'code', str_repeat('d', 200), 'text/plain'],
+    ['content type at 100', 'code', 'description', str_repeat('t', 100), 'code', 'description', str_repeat('t', 100)],
+    ['content type at 101', 'code', 'description', str_repeat('t', 101), 'code', 'description', str_repeat('t', 100)],
+] as [$limitCase, $code, $description, $contentType, $expectedCode, $expectedDescription, $expectedContentType]) {
+    $limitResult = (new WebhookClient(
+        'https://webhook.worksmobile.com/message/test-placeholder',
+        static fn (): array => [
+            'status' => 400,
+            'body' => json_encode(['code' => $code, 'description' => $description], JSON_THROW_ON_ERROR),
+            'headers' => ['Content-Type' => $contentType],
+        ],
+    ))->send('Title', 'Text');
+    $limitAttempt = $limitResult->diagnostic?->attempts[0] ?? null;
+    deliveryCheck($limitAttempt?->providerCode === $expectedCode, $limitCase . ' must use its exact code boundary');
+    deliveryCheck($limitAttempt?->providerDescription === $expectedDescription, $limitCase . ' must use its exact description boundary');
+    deliveryCheck($limitAttempt?->responseContentType === $expectedContentType, $limitCase . ' must use its exact content type boundary');
+}
+
 $invalidJsonBody = 'untrusted response body placeholder';
 $invalidJsonResult = (new WebhookClient(
     'https://webhook.worksmobile.com/message/test-placeholder',

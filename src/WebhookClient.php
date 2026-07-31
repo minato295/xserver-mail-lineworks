@@ -212,7 +212,7 @@ final class WebhookClient
             $status = $response['status'];
             $rawBody = $response['body'];
             $headers = $this->normalizedHeaders($response['headers'] ?? []);
-            $contentType = $this->safeValue($headers['content-type'] ?? null);
+            $contentType = $this->safeValue($headers['content-type'] ?? null, 100);
             $bodyBytes = strlen($rawBody);
             $bodyHash = hash('sha256', $rawBody);
             try {
@@ -227,13 +227,13 @@ final class WebhookClient
                 ];
             }
             $description = is_array($body) && is_string($body['description'] ?? null)
-                ? $this->safeValue($body['description'])
+                ? $this->safeValue($body['description'], 200)
                 : '';
             $code = is_array($body) && (is_int($body['code'] ?? null) || is_string($body['code'] ?? null))
                 ? $body['code']
                 : null;
             if (is_string($code)) {
-                $code = $this->safeValue($code);
+                $code = $this->safeValue($code, 64);
             }
             $success = $status === 200 && $code === 200 && $description === 'success';
             $classification = $success ? 'success' : match ($description) {
@@ -296,14 +296,14 @@ final class WebhookClient
         return $headers;
     }
 
-    private function safeValue(?string $value): ?string
+    private function safeValue(?string $value, int $maximumCharacters): ?string
     {
         if ($value === null) {
             return null;
         }
         $safe = trim((string) preg_replace('/[\\x00-\\x1F\\x7F]/u', '', $value));
         $characters = preg_split('//u', $safe, -1, PREG_SPLIT_NO_EMPTY) ?: [];
-        return implode('', array_slice($characters, 0, 256));
+        return implode('', array_slice($characters, 0, $maximumCharacters));
     }
 
     private function characterCount(string $value): int
