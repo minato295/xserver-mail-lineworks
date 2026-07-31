@@ -102,7 +102,7 @@ final class WebhookClient
         }
 
         $sequence = $this->healthMonitor?->reserveObservation();
-        $request = $this->requestWithRateLimitRetry($payload);
+        $request = $this->requestWithRateLimitRetry($payload, $title, $text);
         $result = $this->withDiagnostic($request, $payload, $title, $text);
         if ($result->isSuccess()) {
             return new ObservedWebhookResult($result, $sequence);
@@ -119,15 +119,16 @@ final class WebhookClient
         $attempts = $request['attempts'];
         $recoveredByRetry = $request['recoveredByRetry'];
         foreach ($chunks as $index => $chunk) {
+            $chunkText = sprintf('(%d/%d) %s', $index + 1, $count, $chunk);
             try {
-                $chunkPayload = $this->payload($title, sprintf('(%d/%d) %s', $index + 1, $count, $chunk));
+                $chunkPayload = $this->payload($title, $chunkText);
             } catch (JsonException) {
                 return new ObservedWebhookResult(
                     new WebhookResult(false, null, 'invalid_payload'),
                     $sequence,
                 );
             }
-            $chunkRequest = $this->requestWithRateLimitRetry($chunkPayload);
+            $chunkRequest = $this->requestWithRateLimitRetry($chunkPayload, $title, $chunkText);
             $attempts = [...$attempts, ...$chunkRequest['attempts']];
             $recoveredByRetry = $recoveredByRetry || $chunkRequest['recoveredByRetry'];
             $chunkResult = $this->withDiagnostic(
@@ -167,9 +168,9 @@ final class WebhookClient
     /**
      * @return array{result:WebhookResult,attempts:list<WebhookAttemptDiagnostic>,recoveredByRetry:bool}
      */
-    private function requestWithRateLimitRetry(string $payload): array
+    private function requestWithRateLimitRetry(string $payload, string $title, string $text): array
     {
-        $response = $this->request($payload);
+        $response = $this->request($payload, $title, $text);
         $attempts = [$response['attempt']];
         $status = $response['result']->httpStatus;
         $delay = null;
@@ -186,7 +187,7 @@ final class WebhookClient
         }
         ($this->sleeper)($delay);
 
-        $retry = $this->request($payload);
+        $retry = $this->request($payload, $title, $text);
         $attempts[] = $retry['attempt'];
         return [
             'result' => $retry['result'],
@@ -196,7 +197,7 @@ final class WebhookClient
     }
 
     /** @return array{result:WebhookResult,headers:array<string,string>,attempt:WebhookAttemptDiagnostic} */
-    private function request(string $payload): array
+    private function request(string $payload, string $title, string $text): array
     {
         try {
             /** @var array{status:int,body:string,headers?:array<string,string>} $response */
@@ -236,15 +237,19 @@ final class WebhookClient
                 default => 'http_error',
             };
             $diagnosticDescription = $description;
-            if ($description !== '' && $this->isPayloadEcho($description, $payload)) {
+            if ($description !== '' && $this->isPayloadEcho($description, $title, $text)) {
                 $diagnosticDescription = '';
+            }
+            $diagnosticCode = $code;
+            if (is_string($code) && $code !== '' && $this->isPayloadEcho($code, $title, $text)) {
+                $diagnosticCode = null;
             }
 
             return [
                 'result' => new WebhookResult($success, $status, $classification),
                 'headers' => $headers,
                 'attempt' => new WebhookAttemptDiagnostic(
-                    $status, $code, $diagnosticDescription === '' ? null : $diagnosticDescription,
+                    $status, $diagnosticCode, $diagnosticDescription === '' ? null : $diagnosticDescription,
                     'json', $contentType, $bodyBytes, $bodyHash,
                 ),
             ];
@@ -318,21 +323,13 @@ final class WebhookClient
         return $characters;
     }
 
-    private function isPayloadEcho(string $description, string $payload): bool
+    private function isPayloadEcho(string $value, string $title, string $text): bool
     {
-        if (strlen($description) < 8) {
+        if (strlen($value) < 8) {
             return false;
         }
-        try {
-            $decoded = json_decode($payload, true, 8, JSON_THROW_ON_ERROR);
-        } catch (JsonException) {
-            return true;
-        }
-        $title = is_array($decoded) && is_string($decoded['title'] ?? null) ? $decoded['title'] : '';
-        $text = is_array($decoded) && is_array($decoded['body'] ?? null)
-            && is_string($decoded['body']['text'] ?? null) ? $decoded['body']['text'] : '';
-        return $this->sharesByteFragment($description, $title, 8)
-            || $this->sharesByteFragment($description, $text, 8);
+        return $this->sharesByteFragment($value, $title, 8)
+            || $this->sharesByteFragment($value, $text, 8);
     }
 
     private function sharesByteFragment(string $left, string $right, int $minimumBytes): bool

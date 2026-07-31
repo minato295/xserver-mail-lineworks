@@ -44,7 +44,7 @@ LINE WORKS Incoming WebhookがHTTP 500などを返した際に、メール本文
 
 診断項目はWebhookの最終結果と、同一送信処理内の試行履歴を表す。再試行で成功した場合も初回エラーの状態・コード・説明を保持し、一時障害だったことを判定可能にする。
 
-`provider_code`と`provider_description`は信頼済みのローカル値ではなく、外部LINE WORKS応答本文から抽出した非信頼入力である。`WebhookClient`と`OperationalLogger`の両境界で型、制御文字、長さ、応答形式との相関を検証する。provider固有の接頭辞・接尾辞を含む場合も、送信payloadのtitleまたはtextとの間に8 bytes以上の共通連続断片がある説明は例外なく保存せず`null`とする。判定は8-byte window集合を構築して各入力を一度ずつ走査し、payload長と説明長の積に比例する反復検索を避ける。残るprovider説明も外部入力として扱い、Mac consumerはC0・DEL・C1をfail-closedで拒否し、表示時にもURL、メールアドレス、hash、制御文字を再検査する。これらの多層防御によってメール内容を保存しない契約を維持する。
+`provider_code`と`provider_description`は信頼済みのローカル値ではなく、外部LINE WORKS応答本文から抽出した非信頼入力である。`WebhookClient`と`OperationalLogger`の両境界で型、制御文字、長さ、応答形式との相関を検証する。provider固有の接頭辞・接尾辞を含む場合も、送信payloadのtitleまたはtextとの間に8 bytes以上の共通連続断片がある文字列codeまたは説明は例外なく保存せず`null`とする。整数codeは文字列echo判定を行わず保持する。`sendObserved`から初回、retry、分割chunkのprivate request chainへ実際のtitle/textを渡し、echo判定のためにpayload JSON全体を`json_decode`して複製しない。判定は8-byte window集合を構築して各入力を一度ずつ走査し、payload長とprovider値長の積に比例する反復検索を避ける。残るprovider値も外部入力として扱い、Mac consumerはC0・DEL・C1をfail-closedで拒否し、表示時にもURL、メールアドレス、hash、制御文字を再検査する。これらの多層防御によってメール内容を保存しない契約を維持する。
 
 ## 保存禁止情報
 
@@ -101,7 +101,7 @@ LINE WORKS Incoming WebhookがHTTP 500などを返した際に、メール本文
 - 既存形式のログをMac管理CLIが読み取れることを検証する。
 - `0600`以外のログ、`0700`以外の親、シンボリックリンク、所有者不一致を拒否する。
 - 240 KiB境界と改行なしpartial tailで完全JSONL行だけを保持し、最新の既存イベントと新イベントを失わず、成功後も256 KiB未満であることを検証する。固定sidecar lock下の並行writer、tempのsymlink/wrong-mode、short write、flush、rename前後の障害を注入し、置換前は旧logがbyte単位で不変、置換後は完全な新logだけになること、再起動相当の次回追記でpartial tailを回復することを検証する。
-- provider説明のASCII・日本語の接頭辞/接尾辞付きecho、無関係な通常説明、7-byte以下の共通断片、10 MiB payloadを検証する。
+- provider説明と文字列codeのASCII・日本語の接頭辞/接尾辞付きecho、無関係な通常値、7-byte以下の共通断片、integer code保持、永続ログ非漏えい、10 MiB payloadの正しさと追加peak memory上限を検証する。
 - MLSTはRFC形式の任意reply textを持つ`250-...` / `250 ...` envelopeを許可しつつ、内部のfact entryを厳密に1件、完全path、`type=file`、mode `0600`へ束縛する。factを装う不正行、複数entry、偽envelopeは拒否する。
 - 全既存テストと公開リポジトリ向け秘密情報スキャンを実行する。
 

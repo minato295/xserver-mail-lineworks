@@ -342,7 +342,50 @@ $japaneseEchoResult = (new WebhookClient(
 deliveryCheck($japaneseEchoResult->diagnostic?->attempts[0]->providerDescription === null,
     'Provider description sharing eight payload bytes inside Japanese text must be redacted');
 
+$providerCodeCases = [
+    ['ascii-prefix-suffix', 'provider-prefix private-code-fragment provider-suffix',
+        'Title', 'Text private-code-fragment tail', null],
+    ['japanese-prefix-suffix', 'コード: 秘密情報 :終端',
+        '件名に秘密情報があります', '本文', null],
+    ['seven-byte-fragment', 'seven77',
+        'Title', 'Text seven77 tail', 'seven77'],
+    ['unrelated', 'E_VALIDATION_42',
+        'Unrelated title', 'Completely separate webhook body', 'E_VALIDATION_42'],
+];
+$codeEchoResult = null;
+foreach ($providerCodeCases as [$label, $providerCode, $codeTitle, $codeText, $expectedCode]) {
+    $codeResult = (new WebhookClient(
+        'https://webhook.worksmobile.com/message/test-placeholder',
+        static fn (): array => [
+            'status' => 400,
+            'body' => json_encode([
+                'code' => $providerCode,
+                'description' => 'ordinary provider explanation',
+            ], JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE),
+            'headers' => [],
+        ],
+    ))->send($codeTitle, $codeText);
+    deliveryCheck($codeResult->diagnostic?->attempts[0]->providerCode === $expectedCode,
+        $label . ' string provider code must follow the exact eight-byte payload echo boundary');
+    if ($label === 'ascii-prefix-suffix') {
+        $codeEchoResult = $codeResult;
+    }
+}
+deliveryCheck($codeEchoResult instanceof \XserverMail\WebhookResult,
+    'Persistent provider-code echo fixture must be available');
+
+$integerCodeResult = (new WebhookClient(
+    'https://webhook.worksmobile.com/message/test-placeholder',
+    static fn (): array => response(400, 'ordinary provider explanation'),
+))->send('Title 400', 'Text 400');
+deliveryCheck($integerCodeResult->diagnostic?->attempts[0]->providerCode === 400,
+    'Integer provider codes must remain available and must not enter text echo detection');
+
 $largeEchoText = str_repeat('x', 10 * 1024 * 1024) . 'private-tail-fragment';
+if (function_exists('memory_reset_peak_usage')) {
+    memory_reset_peak_usage();
+}
+$largeEchoBaselineMemory = memory_get_usage(true);
 $largeEchoStarted = microtime(true);
 $largeEchoResult = (new WebhookClient(
     'https://webhook.worksmobile.com/message/test-placeholder',
@@ -353,6 +396,10 @@ deliveryCheck($largeEchoResult->diagnostic?->attempts[0]->providerDescription ==
     'Provider description sharing an internal fragment with a 10 MiB payload must be redacted');
 deliveryCheck($largeEchoElapsed < 5.0,
     'Payload echo detection must scan a 10 MiB payload without repeated pathological full-string searches');
+if (function_exists('memory_reset_peak_usage')) {
+    deliveryCheck(memory_get_peak_usage(true) - $largeEchoBaselineMemory < 18 * 1024 * 1024,
+        'Payload echo detection must not decode and duplicate the full 10 MiB payload JSON');
+}
 
 $unrelatedDescription = 'ordinary provider explanation';
 $unrelatedEchoResult = (new WebhookClient(
@@ -504,6 +551,15 @@ $echoLogBytes = (string) file_get_contents($echoLogPath);
 deliveryCheck(!str_contains($echoLogBytes, $echoedDescription)
     && str_contains($echoLogBytes, '"provider_description":null'),
     'Direct provider echo of a payload fragment must not reach persistent diagnostics');
+$codeEchoLogPath = $logDirectory . '/provider-code-echo.jsonl';
+(new OperationalLogger($codeEchoLogPath))->log(
+    'failure', str_repeat('8', 64), $codeEchoResult->classification,
+    $codeEchoResult->httpStatus, $codeEchoResult->diagnostic,
+);
+$codeEchoLogBytes = (string) file_get_contents($codeEchoLogPath);
+deliveryCheck(!str_contains($codeEchoLogBytes, 'private-code-fragment')
+    && str_contains($codeEchoLogBytes, '"provider_code":null'),
+    'String provider-code payload echo must not reach persistent diagnostics');
 $logger->log('success', str_repeat('0', 64), 'success', 200);
 $logger->log(
     'success', str_repeat('1', 64), 'success', 200, $diagnosticResult->diagnostic,
@@ -1154,6 +1210,7 @@ deliveryCheck(!file_exists($publicLogPath), 'Rejected public path must not recei
 
 unlink($logPath);
 unlink($echoLogPath);
+unlink($codeEchoLogPath);
 unlink($loggerBoundaryPath);
 unlink($templateLogPath);
 unlink($exactBoundaryPath);
