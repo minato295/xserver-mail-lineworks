@@ -17,6 +17,7 @@ use XserverMail\SendmailProcessAdapter;
 use XserverMail\SendmailProcessHandle;
 use XserverMail\SystemMailAuthenticator;
 use XserverMail\WebhookClient;
+use XserverMail\WebhookDiagnostic;
 use XserverMail\StdinFrame;
 
 function deliveryCheck(bool $condition, string $message): void
@@ -251,6 +252,73 @@ $rateLimited = new WebhookClient(
 deliveryCheck($rateLimited->send('Title', 'Text')->isSuccess(), 'One bounded 429 retry may succeed');
 deliveryCheck(count($attempts) === 2 && $attempts[0] === $attempts[1], '429 retry must reuse the identical payload once');
 deliveryCheck($sleeps === [2], '429 retry must honor a bounded RateLimit-Reset');
+
+$serverAttempts = [];
+$serverSleeps = [];
+$serverFailure = new WebhookClient(
+    'https://webhook.worksmobile.com/message/test-placeholder',
+    static function (string $url, string $payload) use (&$serverAttempts): array {
+        $serverAttempts[] = $payload;
+        return count($serverAttempts) === 1
+            ? response(500, 'server error')
+            : response(200, 'success');
+    },
+    256,
+    static function (int $seconds) use (&$serverSleeps): void { $serverSleeps[] = $seconds; },
+);
+deliveryCheck($serverFailure->send('Title', 'Text')->isSuccess(), 'One bounded HTTP 5xx retry may succeed');
+deliveryCheck(
+    count($serverAttempts) === 2 && $serverAttempts[0] === $serverAttempts[1],
+    'HTTP 5xx retry must reuse the identical payload once',
+);
+deliveryCheck($serverSleeps === [5], 'HTTP 5xx retry must wait before retrying');
+
+$diagnosticResponses = [
+    [
+        'status' => 500,
+        'body' => "{\"code\":\"E500\",\"description\":\"temporary\\u0000 failure\"}",
+        'headers' => ['Content-Type' => 'application/json; charset=UTF-8'],
+    ],
+    response(200, 'success'),
+];
+$diagnosticClient = new WebhookClient(
+    'https://webhook.worksmobile.com/message/test-placeholder',
+    static function () use (&$diagnosticResponses): array {
+        return array_shift($diagnosticResponses);
+    },
+    256,
+    static function (): void {},
+);
+$diagnosticResult = $diagnosticClient->send('題名', '本文');
+deliveryCheck($diagnosticResult->isSuccess(), 'HTTP 5xx retry must recover');
+deliveryCheck($diagnosticResult->diagnostic instanceof WebhookDiagnostic, 'Webhook result must expose diagnostics');
+deliveryCheck($diagnosticResult->diagnostic->attemptHttpStatuses() === [500, 200], 'Diagnostics must preserve both statuses');
+deliveryCheck($diagnosticResult->diagnostic->recoveredByRetry, 'Retry recovery must be explicit');
+deliveryCheck($diagnosticResult->diagnostic->attempts[0]->providerCode === 'E500', 'Provider code must be preserved safely');
+deliveryCheck($diagnosticResult->diagnostic->attempts[0]->providerDescription === 'temporary failure', 'Controls must be removed');
+
+$invalidJsonBody = 'untrusted response body placeholder';
+$invalidJsonResult = (new WebhookClient(
+    'https://webhook.worksmobile.com/message/test-placeholder',
+    static fn (): array => ['status' => 502, 'body' => $invalidJsonBody, 'headers' => []],
+))->send('Title', 'Text');
+deliveryCheck($invalidJsonResult->diagnostic instanceof WebhookDiagnostic, 'Invalid JSON result must expose diagnostics');
+$invalidJsonAttempt = $invalidJsonResult->diagnostic->attempts[0];
+deliveryCheck($invalidJsonAttempt->responseFormat === 'invalid_json', 'Non-JSON response must be identified without retaining its body');
+deliveryCheck(!array_key_exists('responseBody', get_object_vars($invalidJsonAttempt)), 'Diagnostics must not expose a response body');
+deliveryCheck(!str_contains(serialize($invalidJsonAttempt), $invalidJsonBody), 'Diagnostics must not retain a response body');
+
+$transportMessage = 'transport secret placeholder';
+$transportResult = (new WebhookClient(
+    'https://webhook.worksmobile.com/message/test-placeholder',
+    static function () use ($transportMessage): array {
+        throw new RuntimeException($transportMessage);
+    },
+))->send('Title', 'Text');
+deliveryCheck($transportResult->diagnostic instanceof WebhookDiagnostic, 'Transport result must expose diagnostics');
+$transportAttempt = $transportResult->diagnostic->attempts[0];
+deliveryCheck($transportAttempt->responseFormat === 'transport_error', 'Transport exceptions must be identified without their message');
+deliveryCheck(!str_contains(serialize($transportAttempt), $transportMessage), 'Diagnostics must not retain exception messages');
 
 foreach ([
     'missing parameter ' => 'missing_parameter',
@@ -732,9 +800,15 @@ deliveryCheck(count($dedupRequests) === 7, 'Raw RFC5322 fallback must treat tran
 $retryCalls = 0;
 $retryWebhook = new WebhookClient('https://webhook.worksmobile.com/message/test', static function () use (&$retryCalls): array {
     ++$retryCalls;
-    return $retryCalls === 1 ? response(500, 'server error') : response(200, 'success');
-});
-$retryReporter = new ErrorReporter($retryWebhook, $dedupLogger);
+    return $retryCalls <= 2 ? response(500, 'server error') : response(200, 'success');
+}, 32_768, static function (): void {});
+$retryReporter = new ErrorReporter(
+    new WebhookClient(
+        'https://webhook.worksmobile.com/message/test',
+        static fn (): array => response(200, 'success'),
+    ),
+    $dedupLogger,
+);
 $retryApplication = new DeliveryApplication($retryWebhook, $retryReporter, $dedupLogger, null, $appDedup);
 $retryRaw = str_replace('<same@example.invalid>', '<retry@example.invalid>', $sameRaw);
 $retryApplication->deliver($retryRaw);
@@ -748,13 +822,13 @@ $throwingReporter = new ErrorReporter(
 $reporterDeliveryCalls = 0;
 $reporterDeliveryWebhook = new WebhookClient('https://webhook.worksmobile.com/message/test', static function () use (&$reporterDeliveryCalls): array {
     ++$reporterDeliveryCalls;
-    return $reporterDeliveryCalls === 1 ? response(500, 'server error') : response(200, 'success');
-});
+    return $reporterDeliveryCalls <= 2 ? response(500, 'server error') : response(200, 'success');
+}, 32_768, static function (): void {});
 $reporterRetryRaw = str_replace('<same@example.invalid>', '<reporter-retry@example.invalid>', $sameRaw);
 $reporterRetryApplication = new DeliveryApplication($reporterDeliveryWebhook, $throwingReporter, $dedupLogger, null, $appDedup);
 $reporterRetryApplication->deliver($reporterRetryRaw);
 $reporterRetryApplication->deliver($reporterRetryRaw);
-deliveryCheck($reporterDeliveryCalls === 2, 'Reporter failure must not prevent reservation release and later retry');
+deliveryCheck($reporterDeliveryCalls === 3, 'Reporter failure must not prevent reservation release and later retry');
 
 $failedStorePath = $appDedupDirectory . '/missing/claims.json';
 $failedStore = new DeliveryDeduplicator($failedStorePath);
