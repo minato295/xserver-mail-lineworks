@@ -1163,7 +1163,8 @@ class MailManager:
                     and (type(status) is not int or not 100 <= status <= 599))
                 or type(event["message_id_hash"]) is not str
                 or re.fullmatch(r"[a-f0-9]{64}", event["message_id_hash"]) is None
-                or (outcome == "success" and (classification != "success" or status != 200))
+                or (outcome == "success" and (
+                    classification not in {"success", "internal_error"} or status != 200))
                 or (outcome == "ignored"
                     and (classification != "non_target_recipient" or status is not None))
                 or (outcome == "failure"
@@ -1194,9 +1195,10 @@ class MailManager:
         description = event["provider_description"]
         content_type = event["response_content_type"]
         body_hash = event["response_body_sha256"]
+        response_format = event["response_format"]
         integer_fields = ("response_body_bytes", "payload_bytes",
                           "title_characters", "text_characters")
-        if (type(attempt_count) is not int or not 1 <= attempt_count <= 64
+        if (type(attempt_count) is not int or attempt_count < 1
                 or not isinstance(attempts, list) or len(attempts) != attempt_count
                 or any(item is not None and (
                     type(item) is not int or not 100 <= item <= 599) for item in attempts)
@@ -1205,7 +1207,7 @@ class MailManager:
                     and re.search(r"[\x00-\x1f\x7f-\x9f]", code) is None))
                 or not (description is None or (
                     type(description) is str and len(description) <= 200))
-                or event["response_format"] not in {
+                or response_format not in {
                     "json", "invalid_json", "transport_error"
                 }
                 or not (content_type is None or (
@@ -1220,19 +1222,76 @@ class MailManager:
                 or type(event["recovered_by_retry"]) is not bool
                 or event["http_status"] != attempts[-1]):
             raise ValueError("invalid webhook diagnostic")
-        if event["response_format"] == "transport_error":
+        if response_format == "transport_error":
             if (event["response_body_bytes"] != 0 or body_hash is not None
-                    or code is not None or description is not None):
+                    or code is not None or description is not None
+                    or content_type is not None or attempts[-1] is not None
+                    or any(status is None for status in attempts[:-1])):
                 raise ValueError("invalid webhook diagnostic")
-        elif body_hash is None:
+        elif body_hash is None or any(status is None for status in attempts):
             raise ValueError("invalid webhook diagnostic")
+        if response_format == "invalid_json" and (code is not None or description is not None):
+            raise ValueError("invalid webhook diagnostic")
+
+        safe_description = (None if description is None else re.sub(
+            r"[\x00-\x1f\x7f]", "", description
+        ).strip())
+
+        def json_classification():
+            return {
+                "invalid parameter": "invalid_parameter",
+                "missing parameter": "missing_parameter",
+                "invalid webhook URL": "invalid_webhook_url",
+                "too many request": "rate_limited",
+            }.get(safe_description, "http_error")
+
         recovered = event["recovered_by_retry"]
-        if recovered:
-            if (event["outcome"] != "success" or attempt_count < 2
-                    or attempts[-1] != 200 or all(item == 200 for item in attempts[:-1])):
-                raise ValueError("invalid webhook diagnostic")
-        elif event["outcome"] == "failure":
-            pass
+        if recovered and not any(
+                (status == 429 or type(status) is int and 500 <= status <= 599)
+                and attempts[index + 1] == 200
+                for index, status in enumerate(attempts[:-1])):
+            raise ValueError("invalid webhook diagnostic")
+
+        if event["outcome"] == "failure":
+            if response_format == "transport_error":
+                if event["http_status"] is not None or event["classification"] != "transport_error":
+                    raise ValueError("invalid webhook diagnostic")
+            elif response_format == "invalid_json":
+                if (event["http_status"] is None
+                        or event["classification"] != "http_error"):
+                    raise ValueError("invalid webhook diagnostic")
+            else:
+                successful_response = (
+                    event["http_status"] == 200 and code == 200
+                    and safe_description == "success"
+                )
+                if (event["http_status"] is None or successful_response
+                        or event["classification"] != json_classification()):
+                    raise ValueError("invalid webhook diagnostic")
+        elif event["outcome"] == "success":
+            if attempt_count == 1:
+                if (response_format != "json" or attempts != [200]
+                        or code != 200 or safe_description != "success"):
+                    raise ValueError("invalid webhook diagnostic")
+            else:
+                non_success_statuses = [status for status in attempts[:-1] if status != 200]
+                if (attempts[-1] != 200 or not non_success_statuses
+                        or any(status is None for status in non_success_statuses)
+                        or response_format == "transport_error"):
+                    raise ValueError("invalid webhook diagnostic")
+                relevant_status = non_success_statuses[-1]
+                if recovered:
+                    if not (relevant_status == 429
+                            or type(relevant_status) is int
+                            and 500 <= relevant_status <= 599):
+                        raise ValueError("invalid webhook diagnostic")
+                elif (non_success_statuses != [400] or attempts[0] != 400
+                        or any(status != 200 for status in attempts[1:])
+                        or response_format != "json"
+                        or json_classification() != "invalid_parameter"):
+                    raise ValueError("invalid webhook diagnostic")
+        else:
+            raise ValueError("invalid webhook diagnostic")
         return occurred_at, event["outcome"] == "failure" or recovered
 
     @staticmethod
@@ -1240,8 +1299,11 @@ class MailManager:
         if value is None or value == "":
             return "なし"
         text = re.sub(r"[\x00-\x1f\x7f-\x9f]", "", str(value)).strip()
-        if (not text or re.search(r"https?://|webhook[.]worksmobile[.]com", text,
-                                  flags=re.IGNORECASE)
+        if (not text or re.search(
+                    r"(?:\b[a-z][a-z0-9+.-]*:[^\s]|//[^\s]|\bwww[.])",
+                    text, flags=re.IGNORECASE)
+                or re.search(r"webhook[.]worksmobile[.]com", text,
+                             flags=re.IGNORECASE)
                 or re.search(r"[^\s/@]+@[^\s/@]+", text)
                 or re.search(r"(?i)(?<![a-f0-9])[a-f0-9]{64}(?![a-f0-9])", text)):
             return "非表示"
@@ -1303,6 +1365,7 @@ class MailManager:
                 f"{jst:%Y年%m月%d日}（{weekday}）{jst:%H時%M分%S秒} / {outcome} / "
                 f"HTTP {statuses} / コード {self._safe_webhook_diagnostic_text(event['provider_code'])} / "
                 f"説明 {self._safe_webhook_diagnostic_text(event['provider_description'])} / "
+                f"応答形式 {event['response_format']} / "
                 f"再試行 {recovered} / ID {event['message_id_hash'][:12]}"
             )
             return {"webhook_diagnostic": summary}

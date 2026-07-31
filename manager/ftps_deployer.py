@@ -302,32 +302,34 @@ class FtpsDeployer:
         """Bind one canonical absolute-path MLST entry to its requested file."""
         if not isinstance(response, str):
             raise RuntimeError("remote file mode could not be verified")
+        lines = [line.strip() for line in response.splitlines() if line.strip()]
+        if (len(lines) >= 3 and lines[0].startswith("250-Listing")
+                and lines[-1] == "250 End"):
+            entry_lines = lines[1:-1]
+        elif len(lines) == 1 and lines[0].startswith("250 "):
+            entry_lines = [lines[0][4:]]
+        else:
+            raise RuntimeError("remote file mode could not be verified")
         entries = []
-        for raw_line in response.splitlines():
-            line = raw_line.strip()
-            if line.startswith("250 "):
-                line = line[4:]
+        for line in entry_lines:
             if ";" not in line or " " not in line:
-                continue
+                raise RuntimeError("remote file mode could not be verified")
             fact_text, pathname = line.split(None, 1)
             tokens = [token for token in fact_text.split(";") if token]
             if not pathname or not tokens or any("=" not in token for token in tokens):
-                continue
+                raise RuntimeError("remote file mode could not be verified")
             facts = {}
-            duplicate = False
             for token in tokens:
                 name, value = token.split("=", 1)
                 name = name.casefold()
                 if name in facts:
-                    duplicate = True
-                    break
+                    raise RuntimeError("remote file mode could not be verified")
                 facts[name] = value
-            if not duplicate and facts.get("type", "").casefold() == "file":
-                entries.append((pathname, facts))
+            entries.append((pathname, facts))
         if len(entries) != 1:
             raise RuntimeError("remote file mode could not be verified")
         pathname, facts = entries[0]
-        if pathname != remote_path:
+        if pathname != remote_path or facts.get("type", "").casefold() != "file":
             raise RuntimeError("remote file mode could not be verified")
         mode_values = [facts[name] for name in ("unix.mode", "perm-mode") if name in facts]
         if mode_values != ["0" + expected_mode]:

@@ -235,6 +235,40 @@ class FtpsDeployerTest(unittest.TestCase):
         self.assertNotIn(("retrieve", "RETR " + ftps_path), cases[0].calls)
         self.assertNotIn(("retrieve", "RETR " + ftps_path), cases[1].calls)
 
+    def test_private_log_tail_rejects_mlst_with_any_second_entry_or_malformed_line(self):
+        filesystem_path = "/home/example/mail-lineworks/private/log/mail-notifier.jsonl"
+        ftps_path = "/mail-lineworks/private/log/mail-notifier.jsonl"
+        responses = (
+            (
+                "250-Listing\n"
+                " unix.mode=0600;type=file; %s\n"
+                " unix.mode=0700;type=dir; /mail-lineworks/private/log\n"
+                "250 End" % ftps_path
+            ),
+            (
+                "250-Listing\n"
+                " unix.mode=0600;type=file; %s\n"
+                " malformed second entry\n"
+                "250 End" % ftps_path
+            ),
+            (
+                "250-Listing\n"
+                " unix.mode=0600;type=file; %s\n"
+                "250-Listing injected second envelope\n"
+                "250 End" % ftps_path
+            ),
+        )
+        for response in responses:
+            ftps = FakeFtps({ftps_path: b"safe\n"}, mlst_response=response)
+            deployer = FtpsDeployer(
+                "ftp.example.invalid", "user", "password",
+                config_remote_path="/mail-lineworks/private/config.json",
+                filesystem_home="/home/example", ftp_factory=lambda: ftps,
+            )
+            with self.subTest(response=response), self.assertRaises(RuntimeError):
+                deployer.read_private_log_tail(filesystem_path, limit=256 * 1024)
+            self.assertNotIn(("retrieve", "RETR " + ftps_path), ftps.calls)
+
     def test_private_log_tail_rejects_nonfixed_or_public_path_before_connecting(self):
         ftps = FakeFtps()
         deployer = FtpsDeployer(
