@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - 本番ログは`/home/s3710/mail-lineworks/private/log/mail-notifier.jsonl`を使用し、`public_html`配下へ保存しない。
-- ログファイルは`0600`、親ディレクトリは`0700`を必須とする。
+- ログファイルは`0600`、親ディレクトリは`0700`を必須とする。サーバー実行時は実効UID所有者まで検証し、Mac管理CLIではXserver本人の認証済みFTPS接続と本人ホーム配下の固定private領域を所有者境界とする。
 - メール本文、通知本文、件名、差出人、To、Cc、Bcc、添付名、Webhook URL、認証情報、応答本文原文、例外メッセージを保存しない。
 - `provider_code`は最大64文字、`provider_description`は最大200文字、`response_content_type`は最大100文字とする。
 - 旧形式ログを読み続けられる後方互換性を維持する。
