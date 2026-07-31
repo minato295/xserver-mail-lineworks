@@ -305,12 +305,22 @@ final class WebhookClient
 
     private function characterCount(string $value): int
     {
-        return count(preg_split('//u', $value, -1, PREG_SPLIT_NO_EMPTY) ?: []);
+        if (function_exists('mb_strlen')) {
+            return mb_strlen($value, 'UTF-8');
+        }
+        $characters = 0;
+        $bytes = strlen($value);
+        for ($offset = 0; $offset < $bytes; ++$offset) {
+            if ((ord($value[$offset]) & 0xC0) !== 0x80) {
+                ++$characters;
+            }
+        }
+        return $characters;
     }
 
     private function isPayloadEcho(string $description, string $payload): bool
     {
-        if ($this->characterCount($description) < 8) {
+        if (strlen($description) < 8) {
             return false;
         }
         try {
@@ -321,7 +331,34 @@ final class WebhookClient
         $title = is_array($decoded) && is_string($decoded['title'] ?? null) ? $decoded['title'] : '';
         $text = is_array($decoded) && is_array($decoded['body'] ?? null)
             && is_string($decoded['body']['text'] ?? null) ? $decoded['body']['text'] : '';
-        return str_contains($title, $description) || str_contains($text, $description);
+        return $this->sharesByteFragment($description, $title, 8)
+            || $this->sharesByteFragment($description, $text, 8);
+    }
+
+    private function sharesByteFragment(string $left, string $right, int $minimumBytes): bool
+    {
+        $leftLength = strlen($left);
+        $rightLength = strlen($right);
+        if ($leftLength < $minimumBytes || $rightLength < $minimumBytes) {
+            return false;
+        }
+        if ($leftLength > $rightLength) {
+            [$left, $right] = [$right, $left];
+            [$leftLength, $rightLength] = [$rightLength, $leftLength];
+        }
+
+        $windows = [];
+        $lastLeftOffset = $leftLength - $minimumBytes;
+        for ($offset = 0; $offset <= $lastLeftOffset; ++$offset) {
+            $windows[substr($left, $offset, $minimumBytes)] = true;
+        }
+        $lastRightOffset = $rightLength - $minimumBytes;
+        for ($offset = 0; $offset <= $lastRightOffset; ++$offset) {
+            if (isset($windows[substr($right, $offset, $minimumBytes)])) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** @return list<string> */

@@ -26,13 +26,17 @@ final class OperationalLogger
 
     private readonly Closure $utcClock;
     private readonly Closure $effectiveUid;
-    private readonly ?Closure $beforeCompactionTruncate;
+    private readonly ?Closure $beforeAtomicReplace;
+    private readonly ?Closure $faultInjector;
+    private readonly Closure $writer;
 
     public function __construct(
         private readonly string $path,
         ?callable $utcClock = null,
         ?callable $effectiveUid = null,
-        ?callable $beforeCompactionTruncate = null,
+        ?callable $beforeAtomicReplace = null,
+        ?callable $faultInjector = null,
+        ?callable $writer = null,
     ) {
         $this->utcClock = Closure::fromCallable(
             $utcClock ?? static fn (): DateTimeImmutable => new DateTimeImmutable('now', new DateTimeZone('UTC')),
@@ -43,8 +47,13 @@ final class OperationalLogger
             }
             return posix_geteuid();
         });
-        $this->beforeCompactionTruncate = $beforeCompactionTruncate === null
-            ? null : Closure::fromCallable($beforeCompactionTruncate);
+        $this->beforeAtomicReplace = $beforeAtomicReplace === null
+            ? null : Closure::fromCallable($beforeAtomicReplace);
+        $this->faultInjector = $faultInjector === null
+            ? null : Closure::fromCallable($faultInjector);
+        $this->writer = Closure::fromCallable(
+            $writer ?? static fn ($handle, string $bytes): int|false => fwrite($handle, $bytes),
+        );
     }
 
     public function log(
@@ -311,7 +320,10 @@ final class OperationalLogger
     private function append(string $line): void
     {
         $directoryHandle = null;
+        $lockHandle = null;
         $fileHandle = null;
+        $temporaryHandle = null;
+        $temporaryPath = null;
         try {
             NotifierConfig::assertPrivatePath($this->path);
             $owner = ($this->effectiveUid)();
@@ -332,27 +344,17 @@ final class OperationalLogger
             $directoryStat = fstat($directoryHandle);
             $this->assertDirectory($directory, $directoryHandle, $directoryStat, $owner);
 
-            clearstatcache(true, $path);
-            $named = @lstat($path);
-            if (is_array($named)) {
-                $this->assertRegularFileStat($named, $owner);
-                $fileHandle = @fopen($path, 'r+b');
-            } else {
-                $previousUmask = umask(0077);
-                try {
-                    $fileHandle = @fopen($path, 'x+b');
-                } finally {
-                    umask($previousUmask);
-                }
-            }
-            if (!is_resource($fileHandle)) {
-                throw new RuntimeException('Operational log unavailable');
-            }
-            $this->assertOpenedFile($path, $fileHandle, $owner);
+            $lockPath = $path . '.lock';
+            $lockHandle = $this->openOrCreatePrivateFile($lockPath, $owner);
             $this->assertDirectory($directory, $directoryHandle, $directoryStat, $owner);
-            if (!flock($fileHandle, LOCK_EX)) {
+            if (!flock($lockHandle, LOCK_EX)) {
                 throw new RuntimeException('Operational log unavailable');
             }
+            $this->assertOpenedFile($lockPath, $lockHandle, $owner);
+            $this->assertDirectory($directory, $directoryHandle, $directoryStat, $owner);
+
+            // The fixed sidecar lock, not the replaceable log inode, serializes every writer.
+            $fileHandle = $this->openOrCreatePrivateFile($path, $owner);
             $this->assertOpenedFile($path, $fileHandle, $owner);
             $this->assertDirectory($directory, $directoryHandle, $directoryStat, $owner);
             $opened = fstat($fileHandle);
@@ -360,7 +362,7 @@ final class OperationalLogger
                 throw new RuntimeException('Operational log unavailable');
             }
             $expectedSize = $opened['size'] + strlen($line);
-            if ($expectedSize <= self::MAX_LOG_BYTES) {
+            if ($expectedSize <= self::MAX_LOG_BYTES && $this->hasCompleteTail($fileHandle, $opened['size'])) {
                 if (fseek($fileHandle, 0, SEEK_END) !== 0) {
                     throw new RuntimeException('Operational log unavailable');
                 }
@@ -368,6 +370,9 @@ final class OperationalLogger
                 if (!fflush($fileHandle)) {
                     throw new RuntimeException('Operational log unavailable');
                 }
+                $this->syncFile($fileHandle);
+                $this->assertOpenedFile($path, $fileHandle, $owner);
+                $completedHandle = $fileHandle;
             } else {
                 $retained = $this->compactedTail(
                     $fileHandle,
@@ -376,25 +381,46 @@ final class OperationalLogger
                 );
                 $compacted = $retained . $line;
                 $expectedSize = strlen($compacted);
-                if ($expectedSize > self::MAX_LOG_BYTES || fseek($fileHandle, 0, SEEK_SET) !== 0) {
+                if ($expectedSize > self::MAX_LOG_BYTES) {
                     throw new RuntimeException('Operational log unavailable');
                 }
-                $this->writeAll($fileHandle, $compacted);
-                if (!fflush($fileHandle)) {
+
+                [$temporaryPath, $temporaryHandle] = $this->createPrivateTemporaryFile(
+                    $directory, basename($path), $owner,
+                );
+                $this->injectFault('temp_created', $temporaryPath);
+                $this->assertOpenedFile($temporaryPath, $temporaryHandle, $owner);
+                $this->assertDirectory($directory, $directoryHandle, $directoryStat, $owner);
+                $this->writeAll($temporaryHandle, $compacted);
+                $this->injectFault('before_temp_flush', $temporaryPath);
+                if (!fflush($temporaryHandle)) {
+                    throw new RuntimeException('Operational log unavailable');
+                }
+                $this->syncFile($temporaryHandle);
+                $temporaryStat = fstat($temporaryHandle);
+                $this->assertOpenedFile($temporaryPath, $temporaryHandle, $owner);
+                if (!is_array($temporaryStat) || ($temporaryStat['size'] ?? -1) !== $expectedSize
+                    || $expectedSize > self::MAX_LOG_BYTES) {
                     throw new RuntimeException('Operational log unavailable');
                 }
                 $this->assertOpenedFile($path, $fileHandle, $owner);
                 $this->assertDirectory($directory, $directoryHandle, $directoryStat, $owner);
-                if ($this->beforeCompactionTruncate !== null) {
-                    ($this->beforeCompactionTruncate)();
+                if ($this->beforeAtomicReplace !== null) {
+                    ($this->beforeAtomicReplace)();
                 }
-                if (!ftruncate($fileHandle, $expectedSize) || !fflush($fileHandle)) {
+                $this->injectFault('before_rename', $temporaryPath);
+                if (!@rename($temporaryPath, $path)) {
                     throw new RuntimeException('Operational log unavailable');
                 }
+                $temporaryPath = null;
+                $this->syncDirectory($directoryHandle);
+                $this->injectFault('after_rename', null);
+                $this->assertOpenedFile($path, $temporaryHandle, $owner);
+                $this->assertDirectory($directory, $directoryHandle, $directoryStat, $owner);
+                $completedHandle = $temporaryHandle;
             }
-            $this->assertOpenedFile($path, $fileHandle, $owner);
-            $this->assertDirectory($directory, $directoryHandle, $directoryStat, $owner);
-            $completed = fstat($fileHandle);
+
+            $completed = fstat($completedHandle);
             if (!is_array($completed) || ($completed['size'] ?? -1) !== $expectedSize
                 || $expectedSize > self::MAX_LOG_BYTES) {
                 throw new RuntimeException('Operational log unavailable');
@@ -402,13 +428,118 @@ final class OperationalLogger
         } catch (Throwable $error) {
             throw new RuntimeException('Operational log unavailable', 0, $error);
         } finally {
+            if (is_resource($temporaryHandle)) {
+                fclose($temporaryHandle);
+            }
+            if (is_string($temporaryPath)) {
+                $this->cleanupTemporaryPath($temporaryPath);
+            }
             if (is_resource($fileHandle)) {
-                @flock($fileHandle, LOCK_UN);
                 fclose($fileHandle);
+            }
+            if (is_resource($lockHandle)) {
+                @flock($lockHandle, LOCK_UN);
+                fclose($lockHandle);
             }
             if (is_resource($directoryHandle)) {
                 fclose($directoryHandle);
             }
+        }
+    }
+
+    /** @return resource */
+    private function openOrCreatePrivateFile(string $path, int $owner)
+    {
+        clearstatcache(true, $path);
+        $named = @lstat($path);
+        if (is_array($named)) {
+            $this->assertRegularFileStat($named, $owner);
+            $handle = @fopen($path, 'r+b');
+        } else {
+            $previousUmask = umask(0077);
+            try {
+                $handle = @fopen($path, 'x+b');
+            } finally {
+                umask($previousUmask);
+            }
+            if (!is_resource($handle)) {
+                clearstatcache(true, $path);
+                $named = @lstat($path);
+                if (!is_array($named)) {
+                    throw new RuntimeException('Operational log unavailable');
+                }
+                $this->assertRegularFileStat($named, $owner);
+                $handle = @fopen($path, 'r+b');
+            }
+        }
+        if (!is_resource($handle)) {
+            throw new RuntimeException('Operational log unavailable');
+        }
+        $this->assertOpenedFile($path, $handle, $owner);
+        return $handle;
+    }
+
+    /** @return array{0:string,1:resource} */
+    private function createPrivateTemporaryFile(string $directory, string $basename, int $owner): array
+    {
+        for ($attempt = 0; $attempt < 8; ++$attempt) {
+            $path = $directory . DIRECTORY_SEPARATOR . '.' . $basename . '.tmp.' . bin2hex(random_bytes(16));
+            $previousUmask = umask(0077);
+            try {
+                $handle = @fopen($path, 'x+b');
+            } finally {
+                umask($previousUmask);
+            }
+            if (is_resource($handle)) {
+                $this->assertOpenedFile($path, $handle, $owner);
+                return [$path, $handle];
+            }
+        }
+        throw new RuntimeException('Operational log unavailable');
+    }
+
+    /** @param resource $handle */
+    private function hasCompleteTail($handle, int $size): bool
+    {
+        if ($size === 0) {
+            return true;
+        }
+        if (fseek($handle, -1, SEEK_END) !== 0) {
+            throw new RuntimeException('Operational log unavailable');
+        }
+        return fread($handle, 1) === "\n";
+    }
+
+    /** @param resource $handle */
+    private function syncFile($handle): void
+    {
+        if (function_exists('fsync') && !fsync($handle)) {
+            throw new RuntimeException('Operational log unavailable');
+        }
+    }
+
+    /** @param resource $handle */
+    private function syncDirectory($handle): void
+    {
+        if (function_exists('fsync')) {
+            @fsync($handle);
+        }
+    }
+
+    private function injectFault(string $phase, ?string $temporaryPath): void
+    {
+        if ($this->faultInjector !== null) {
+            ($this->faultInjector)($phase, $temporaryPath);
+        }
+    }
+
+    private function cleanupTemporaryPath(string $path): void
+    {
+        clearstatcache(true, $path);
+        $named = @lstat($path);
+        if (is_array($named)
+            && ((($named['mode'] ?? 0) & 0170000) === 0100000 || (($named['mode'] ?? 0) & 0170000) === 0120000)) {
+            @unlink($path);
         }
     }
 
@@ -417,7 +548,7 @@ final class OperationalLogger
     {
         $offset = 0;
         while ($offset < strlen($bytes)) {
-            $written = fwrite($handle, substr($bytes, $offset));
+            $written = ($this->writer)($handle, substr($bytes, $offset));
             if (!is_int($written) || $written < 1) {
                 throw new RuntimeException('Operational log unavailable');
             }

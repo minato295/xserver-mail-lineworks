@@ -1079,6 +1079,9 @@ healthCheck($recursiveFailureCaught && $recursiveReuse === 'sequential-success' 
 unlink($recursiveLock);
 rmdir($recursiveDirectory);
 rmdir($recursiveHome);
+foreach (glob($healthLogFixtureDirectory . '/*.lock') ?: [] as $operationalLockPath) {
+    unlink($operationalLockPath);
+}
 rmdir($healthLogFixtureDirectory);
 
 fwrite(STDOUT, "PASS: delivery health state machine and Japanese alert contract\n");

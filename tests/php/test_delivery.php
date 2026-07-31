@@ -328,6 +328,40 @@ $echoResult = (new WebhookClient(
 deliveryCheck($echoResult->diagnostic?->attempts[0]->providerDescription === null,
     'Provider description that directly echoes an 8+ character payload fragment must not be retained');
 
+$wrappedEchoResult = (new WebhookClient(
+    'https://webhook.worksmobile.com/message/test-placeholder',
+    static fn (): array => response(400, 'provider rejected: private payload fragment (invalid)'),
+))->send('Title', 'Prefix private payload fragment suffix');
+deliveryCheck($wrappedEchoResult->diagnostic?->attempts[0]->providerDescription === null,
+    'Provider description with a prefix and suffix around an 8-byte payload fragment must be redacted');
+
+$japaneseEchoResult = (new WebhookClient(
+    'https://webhook.worksmobile.com/message/test-placeholder',
+    static fn (): array => response(400, 'エラー: 秘密情報 が含まれます'),
+))->send('件名に秘密情報があります', '本文');
+deliveryCheck($japaneseEchoResult->diagnostic?->attempts[0]->providerDescription === null,
+    'Provider description sharing eight payload bytes inside Japanese text must be redacted');
+
+$largeEchoText = str_repeat('x', 10 * 1024 * 1024) . 'private-tail-fragment';
+$largeEchoStarted = microtime(true);
+$largeEchoResult = (new WebhookClient(
+    'https://webhook.worksmobile.com/message/test-placeholder',
+    static fn (): array => response(400, 'provider prefix private-tail-fragment provider suffix'),
+))->send('Title', $largeEchoText);
+$largeEchoElapsed = microtime(true) - $largeEchoStarted;
+deliveryCheck($largeEchoResult->diagnostic?->attempts[0]->providerDescription === null,
+    'Provider description sharing an internal fragment with a 10 MiB payload must be redacted');
+deliveryCheck($largeEchoElapsed < 5.0,
+    'Payload echo detection must scan a 10 MiB payload without repeated pathological full-string searches');
+
+$unrelatedDescription = 'ordinary provider explanation';
+$unrelatedEchoResult = (new WebhookClient(
+    'https://webhook.worksmobile.com/message/test-placeholder',
+    static fn (): array => response(400, $unrelatedDescription),
+))->send('Unrelated title', 'Completely separate webhook body');
+deliveryCheck($unrelatedEchoResult->diagnostic?->attempts[0]->providerDescription === $unrelatedDescription,
+    'Unrelated provider descriptions must remain diagnostically useful');
+
 $shortEchoResult = (new WebhookClient(
     'https://webhook.worksmobile.com/message/test-placeholder',
     static fn (): array => response(400, 'seven77'),
@@ -702,6 +736,27 @@ chmod($exactBoundaryPath, 0600);
 deliveryCheck(filesize($exactBoundaryPath) === $boundedMaximum,
     'Operational log may reach but never exceed the 240 KiB server bound');
 
+$partialTailPath = $logDirectory . '/partial-tail.jsonl';
+$partialPriorHash = str_repeat('6', 64);
+$partialNewHash = str_repeat('7', 64);
+$partialPriorLine = json_encode([
+    'message_id_hash' => $partialPriorHash,
+], JSON_THROW_ON_ERROR) . "\n";
+file_put_contents($partialTailPath, $partialPriorLine . '{"torn":');
+chmod($partialTailPath, 0600);
+(new OperationalLogger($partialTailPath, $fixedLogClock))->log(
+    'success', $partialNewHash, 'success', 200,
+);
+$recoveredPartialBytes = (string) file_get_contents($partialTailPath);
+deliveryCheck(str_contains($recoveredPartialBytes, $partialPriorHash)
+    && str_contains($recoveredPartialBytes, $partialNewHash)
+    && !str_contains($recoveredPartialBytes, 'torn'),
+    'A partial tail below the size bound must force recovery compaction before appending');
+foreach (array_filter(explode("\n", $recoveredPartialBytes)) as $recoveredPartialLine) {
+    deliveryCheck(json_decode($recoveredPartialLine, false, 16, JSON_THROW_ON_ERROR) instanceof stdClass,
+        'Partial-tail recovery must leave only complete independent JSON-object lines');
+}
+
 $retainedHash = str_repeat('b', 64);
 $newHash = str_repeat('c', 64);
 $seedLines = [];
@@ -745,10 +800,10 @@ foreach (array_filter(explode("\n", $compactedBytes)) as $compactedLine) {
 }
 deliveryCheck(is_array($beforeCompaction) && is_array($afterCompaction)
     && $beforeCompaction['dev'] === $afterCompaction['dev']
-    && $beforeCompaction['ino'] === $afterCompaction['ino']
+    && $beforeCompaction['ino'] !== $afterCompaction['ino']
     && ($afterCompaction['mode'] & 0777) === 0600
     && $afterCompaction['uid'] === posix_geteuid() && $afterCompaction['nlink'] === 1,
-    'Compaction must preserve inode, owner-only mode, effective owner, and one-link identity');
+    'Compaction must atomically replace the inode with an owner-only one-link file');
 
 $oversizedEventPath = $logDirectory . '/oversized-event.jsonl';
 file_put_contents($oversizedEventPath, "UNCHANGED_OVERSIZED_EVENT\n");
@@ -773,6 +828,7 @@ $faultPath = $logDirectory . '/bounded-fault.jsonl';
 file_put_contents($faultPath, $oversizedSeed);
 chmod($faultPath, 0600);
 $beforeFault = lstat($faultPath);
+$beforeFaultBytes = (string) file_get_contents($faultPath);
 try {
     (new OperationalLogger(
         $faultPath,
@@ -790,8 +846,236 @@ $faultBytes = (string) file_get_contents($faultPath);
 deliveryCheck(is_array($beforeFault) && is_array($afterFault)
     && $beforeFault['size'] === $afterFault['size']
     && $beforeFault['ino'] === $afterFault['ino']
-    && str_contains($faultBytes, $retainedHash),
-    'Failure before truncate must preserve the old length, inode, and latest valid tail event');
+    && hash_equals($beforeFaultBytes, $faultBytes),
+    'Failure before atomic replacement must preserve every byte and the inode of the old log');
+
+$wrongModeLockPath = $logDirectory . '/wrong-mode-lock.jsonl';
+file_put_contents($wrongModeLockPath . '.lock', 'lock');
+chmod($wrongModeLockPath . '.lock', 0644);
+try {
+    (new OperationalLogger($wrongModeLockPath, $fixedLogClock))->log(
+        'success', str_repeat('1', 64), 'success', 200,
+    );
+    throw new RuntimeException('Wrong-mode sidecar lock was accepted');
+} catch (RuntimeException $exception) {
+    deliveryCheck($exception->getMessage() !== 'Wrong-mode sidecar lock was accepted',
+        'The fixed sidecar lock must be a mode-0600 regular file');
+}
+deliveryCheck(!file_exists($wrongModeLockPath),
+    'Rejecting a wrong-mode sidecar lock must happen before creating the operational log');
+
+$lockTargetPath = $logDirectory . '/lock-target';
+file_put_contents($lockTargetPath, 'UNCHANGED_LOCK_TARGET');
+chmod($lockTargetPath, 0600);
+$symlinkLockPath = $logDirectory . '/symlink-lock.jsonl';
+symlink($lockTargetPath, $symlinkLockPath . '.lock');
+try {
+    (new OperationalLogger($symlinkLockPath, $fixedLogClock))->log(
+        'success', str_repeat('2', 64), 'success', 200,
+    );
+    throw new RuntimeException('Symlink sidecar lock was accepted');
+} catch (RuntimeException $exception) {
+    deliveryCheck($exception->getMessage() !== 'Symlink sidecar lock was accepted',
+        'The fixed sidecar lock must reject symlinks');
+}
+deliveryCheck((string) file_get_contents($lockTargetPath) === 'UNCHANGED_LOCK_TARGET'
+    && !file_exists($symlinkLockPath),
+    'Rejecting a symlink sidecar lock must not touch its target or create the operational log');
+
+$tempModeFaultPath = $logDirectory . '/temp-mode-fault.jsonl';
+file_put_contents($tempModeFaultPath, $oversizedSeed);
+chmod($tempModeFaultPath, 0600);
+$tempModeFaultBefore = (string) file_get_contents($tempModeFaultPath);
+try {
+    (new OperationalLogger(
+        $tempModeFaultPath,
+        $fixedLogClock,
+        null,
+        null,
+        static function (string $phase, ?string $temporaryPath): void {
+            if ($phase === 'temp_created' && is_string($temporaryPath)) {
+                chmod($temporaryPath, 0644);
+            }
+        },
+    ))->log('success', str_repeat('3', 64), 'success', 200);
+    throw new RuntimeException('Wrong-mode temporary file was accepted');
+} catch (RuntimeException $exception) {
+    deliveryCheck($exception->getMessage() !== 'Wrong-mode temporary file was accepted',
+        'Atomic compaction must reject a temporary file whose mode changes from 0600');
+}
+deliveryCheck(hash_equals($tempModeFaultBefore, (string) file_get_contents($tempModeFaultPath)),
+    'Wrong-mode temporary-file rejection must leave the old log unchanged');
+
+$tempSymlinkFaultPath = $logDirectory . '/temp-symlink-fault.jsonl';
+$tempSymlinkTarget = $logDirectory . '/temp-symlink-target';
+file_put_contents($tempSymlinkFaultPath, $oversizedSeed);
+chmod($tempSymlinkFaultPath, 0600);
+file_put_contents($tempSymlinkTarget, 'UNCHANGED_TEMP_SYMLINK_TARGET');
+chmod($tempSymlinkTarget, 0600);
+$tempSymlinkBefore = (string) file_get_contents($tempSymlinkFaultPath);
+try {
+    (new OperationalLogger(
+        $tempSymlinkFaultPath,
+        $fixedLogClock,
+        null,
+        null,
+        static function (string $phase, ?string $temporaryPath) use ($tempSymlinkTarget): void {
+            if ($phase === 'temp_created' && is_string($temporaryPath)) {
+                unlink($temporaryPath);
+                symlink($tempSymlinkTarget, $temporaryPath);
+            }
+        },
+    ))->log('success', str_repeat('a', 64), 'success', 200);
+    throw new RuntimeException('Symlink temporary path was accepted');
+} catch (RuntimeException $exception) {
+    deliveryCheck($exception->getMessage() !== 'Symlink temporary path was accepted',
+        'Atomic compaction must reject replacement of its temporary name by a symlink');
+}
+deliveryCheck(hash_equals($tempSymlinkBefore, (string) file_get_contents($tempSymlinkFaultPath))
+    && (string) file_get_contents($tempSymlinkTarget) === 'UNCHANGED_TEMP_SYMLINK_TARGET',
+    'Temporary symlink rejection must preserve both the old log and symlink target');
+
+$shortWritePath = $logDirectory . '/short-write-fault.jsonl';
+file_put_contents($shortWritePath, $oversizedSeed);
+chmod($shortWritePath, 0600);
+$shortWriteBefore = (string) file_get_contents($shortWritePath);
+$shortWriteCalls = 0;
+try {
+    (new OperationalLogger(
+        $shortWritePath,
+        $fixedLogClock,
+        null,
+        null,
+        null,
+        static function ($handle, string $bytes) use (&$shortWriteCalls): int|false {
+            ++$shortWriteCalls;
+            if ($shortWriteCalls === 1) {
+                return fwrite($handle, substr($bytes, 0, 17));
+            }
+            return false;
+        },
+    ))->log('success', str_repeat('4', 64), 'success', 200);
+    throw new RuntimeException('Partial temporary write was accepted');
+} catch (RuntimeException $exception) {
+    deliveryCheck($exception->getMessage() !== 'Partial temporary write was accepted',
+        'A short then failed temporary write must abort atomic compaction');
+}
+deliveryCheck($shortWriteCalls >= 2
+    && hash_equals($shortWriteBefore, (string) file_get_contents($shortWritePath)),
+    'A partial temporary write must leave the old log unchanged');
+
+$flushFaultPath = $logDirectory . '/flush-fault.jsonl';
+file_put_contents($flushFaultPath, $oversizedSeed);
+chmod($flushFaultPath, 0600);
+$flushFaultBefore = (string) file_get_contents($flushFaultPath);
+try {
+    (new OperationalLogger(
+        $flushFaultPath,
+        $fixedLogClock,
+        null,
+        null,
+        static function (string $phase): void {
+            if ($phase === 'before_temp_flush') {
+                throw new RuntimeException('Injected flush fault');
+            }
+        },
+    ))->log('success', str_repeat('5', 64), 'success', 200);
+    throw new RuntimeException('Temporary flush fault was accepted');
+} catch (RuntimeException $exception) {
+    deliveryCheck($exception->getMessage() !== 'Temporary flush fault was accepted',
+        'A temporary flush fault must abort before atomic replacement');
+}
+deliveryCheck(hash_equals($flushFaultBefore, (string) file_get_contents($flushFaultPath)),
+    'A temporary flush fault must leave the old log unchanged');
+
+$afterRenameFaultPath = $logDirectory . '/after-rename-fault.jsonl';
+file_put_contents($afterRenameFaultPath, $oversizedSeed);
+chmod($afterRenameFaultPath, 0600);
+$afterRenameHash = str_repeat('f', 64);
+try {
+    (new OperationalLogger(
+        $afterRenameFaultPath,
+        $fixedLogClock,
+        null,
+        null,
+        static function (string $phase): void {
+            if ($phase === 'after_rename') {
+                throw new RuntimeException('Injected post-rename interruption');
+            }
+        },
+    ))->log('success', $afterRenameHash, 'success', 200);
+} catch (RuntimeException) {
+}
+$afterRenameBytes = (string) file_get_contents($afterRenameFaultPath);
+deliveryCheck(str_ends_with($afterRenameBytes, "\n")
+    && str_contains($afterRenameBytes, $afterRenameHash)
+    && !str_contains($afterRenameBytes, 'partial'),
+    'An interruption after rename must expose the complete new JSONL file, never a torn replacement');
+foreach (array_filter(explode("\n", $afterRenameBytes)) as $afterRenameLine) {
+    deliveryCheck(json_decode($afterRenameLine, false, 16, JSON_THROW_ON_ERROR) instanceof stdClass,
+        'Every line visible after a post-rename interruption must remain a complete JSON object');
+}
+
+$restartPath = $logDirectory . '/restart-after-fault.jsonl';
+file_put_contents($restartPath, $partialPriorLine . '{"interrupted":');
+chmod($restartPath, 0600);
+try {
+    (new OperationalLogger(
+        $restartPath,
+        $fixedLogClock,
+        null,
+        null,
+        static function (string $phase): void {
+            if ($phase === 'before_rename') {
+                throw new RuntimeException('Injected rename fault');
+            }
+        },
+    ))->log('success', str_repeat('8', 64), 'success', 200);
+} catch (RuntimeException) {
+}
+(new OperationalLogger($restartPath, $fixedLogClock))->log(
+    'success', str_repeat('9', 64), 'success', 200,
+);
+$restartBytes = (string) file_get_contents($restartPath);
+deliveryCheck(!str_contains($restartBytes, 'interrupted')
+    && str_contains($restartBytes, str_repeat('9', 64)),
+    'A new logger process must recover a pre-rename partial-tail failure into complete JSONL');
+
+if (function_exists('pcntl_fork') && function_exists('pcntl_waitpid')) {
+    $parallelPath = $logDirectory . '/parallel-writers.jsonl';
+    file_put_contents($parallelPath, $partialPriorLine . '{"interrupted":');
+    chmod($parallelPath, 0600);
+    $children = [];
+    for ($worker = 0; $worker < 2; ++$worker) {
+        $child = pcntl_fork();
+        if ($child === 0) {
+            try {
+                for ($entry = 0; $entry < 8; ++$entry) {
+                    (new OperationalLogger($parallelPath, $fixedLogClock))->log(
+                        'success', hash('sha256', 'parallel-' . $worker . '-' . $entry), 'success', 200,
+                    );
+                }
+                exit(0);
+            } catch (Throwable) {
+                exit(1);
+            }
+        }
+        deliveryCheck(is_int($child) && $child > 0, 'Parallel writer process must start');
+        $children[] = $child;
+    }
+    foreach ($children as $child) {
+        $status = 0;
+        deliveryCheck(pcntl_waitpid($child, $status) === $child && pcntl_wifexited($status)
+            && pcntl_wexitstatus($status) === 0, 'Parallel writer process must complete successfully');
+    }
+    $parallelLines = array_values(array_filter(explode("\n", (string) file_get_contents($parallelPath))));
+    deliveryCheck(count($parallelLines) === 17,
+        'Fixed sidecar locking must retain the prior event and all 16 parallel appends exactly once');
+    foreach ($parallelLines as $parallelLine) {
+        deliveryCheck(json_decode($parallelLine, false, 16, JSON_THROW_ON_ERROR) instanceof stdClass,
+            'Parallel writers must leave only complete JSON-object lines');
+    }
+}
 
 $wrongOwnerPath = $logDirectory . '/wrong-owner.jsonl';
 file_put_contents($wrongOwnerPath, "UNCHANGED_WRONG_OWNER\n");
@@ -873,13 +1157,33 @@ unlink($echoLogPath);
 unlink($loggerBoundaryPath);
 unlink($templateLogPath);
 unlink($exactBoundaryPath);
+unlink($partialTailPath);
 unlink($compactionPath);
 unlink($oversizedEventPath);
 unlink($faultPath);
+unlink($wrongModeLockPath . '.lock');
+unlink($symlinkLockPath . '.lock');
+unlink($lockTargetPath);
+unlink($tempModeFaultPath);
+unlink($tempSymlinkFaultPath);
+unlink($tempSymlinkTarget);
+unlink($shortWritePath);
+unlink($flushFaultPath);
+unlink($afterRenameFaultPath);
+unlink($restartPath);
+if (isset($parallelPath) && file_exists($parallelPath)) {
+    unlink($parallelPath);
+}
 unlink($wrongOwnerPath);
 unlink($badModePath);
 unlink($symlinkPath);
 unlink($outsideTarget);
+foreach (glob($logDirectory . '/*.lock') ?: [] as $operationalLockPath) {
+    unlink($operationalLockPath);
+}
+foreach (glob($logDirectory . '/.*.tmp.*') ?: [] as $operationalTemporaryPath) {
+    unlink($operationalTemporaryPath);
+}
 rmdir($outsideDirectory);
 rmdir($openParent);
 rmdir($publicLogDirectory);

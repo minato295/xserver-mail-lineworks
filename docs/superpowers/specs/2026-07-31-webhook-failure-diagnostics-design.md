@@ -21,9 +21,9 @@ LINE WORKS Incoming WebhookがHTTP 500などを返した際に、メール本文
 
 - Mac管理CLIの読取り上限256 KiBに対し、サーバー側の運用上限は安全余裕を含む240 KiBとする。
 - 1イベントは最大120 KiBとし、直前の有効イベント1件と新イベント1件を必ず240 KiB内へ収められるようにする。上限超過イベントはファイルを変更せず拒否し、メール処理はfail-openを維持する。
-- `OperationalLogger`は各追記を日常的なpreflightとして扱う。実効UID、親`0700`、通常ファイル、`0600`、symlink不使用、inode、owner、`nlink=1`を検証し、同一file handleの排他lockを得た後に容量を判定する。
-- 追記後に240 KiBを超える場合、完全かつJSON objectとして読める末尾行だけを新しい順に選び、直前の最新有効行を必ず含めてから新イベントを加える。選択結果は先頭から書き、flushが完了してから最後にtruncateする。この順序により途中書込み失敗時にも元ログ末尾の最新有効行を残す。
-- 成功時はflush後にサイズ、inode、mode、owner、`nlink`、親directory identityを再検証する。compactionまたは追記の失敗は固定例外へ正規化し、配送処理はログ失敗で停止しない。
+- `OperationalLogger`は各追記を日常的なpreflightとして扱う。同じprivate directory内の固定sidecar（`<log>.lock`）を通常file、`0600`、実効UID所有、`nlink=1`として安全にopenし、すべての追記とcompactionで`flock(LOCK_EX)`する。lock取得後に現行logのpathとopen descriptorのinode/dev一致、owner、mode、`nlink=1`、親directory identityを再検証する。logとlockのsymlink、hardlink、所有者差異、親directory差替えを拒否する。
+- 追記後に240 KiBを超える場合、または現行末尾が改行で終わらない場合、完全かつJSON objectとして読める末尾行だけを新しい順に選び、直前の最新有効行を必ず含めてから新イベントを加える。同じprivate directoryへ推測困難な名前を用いて排他的に`0600` tempを作成し、完全なJSONLを書いてflushし、可能なら`fsync`した後、size、mode、owner、`nlink=1`とdirectory identityを検証する。現行logを再検証してからatomic renameで置換し、置換後も新descriptorとpath identityを再検証する。
+- tempのsymlink化、mode/owner/link差替え、short write、flush、rename前の障害では安全にtempをcleanupして旧logを一切変更しない。rename後の障害では完全な新logだけが見える。通常追記も固定sidecar lock下で行い、途中追記で残り得るpartial tailは次回起動・追記時の強制compactionで除去する。失敗は固定例外へ正規化し、配送処理はログ失敗で停止しない。
 
 ## 診断データ
 
@@ -44,7 +44,7 @@ LINE WORKS Incoming WebhookがHTTP 500などを返した際に、メール本文
 
 診断項目はWebhookの最終結果と、同一送信処理内の試行履歴を表す。再試行で成功した場合も初回エラーの状態・コード・説明を保持し、一時障害だったことを判定可能にする。
 
-`provider_code`と`provider_description`は信頼済みのローカル値ではなく、外部LINE WORKS応答本文から抽出した非信頼入力である。`WebhookClient`と`OperationalLogger`の両境界で型、制御文字、長さ、応答形式との相関を検証する。送信payload内の8文字以上の連続断片を直接echoする説明は例外なく保存せず`null`とする。残るprovider説明も外部入力として扱い、Mac consumerはC0・DEL・C1をfail-closedで拒否し、表示時にもURL、メールアドレス、hash、制御文字を再検査する。これらの多層防御によってメール内容を保存しない契約を維持する。
+`provider_code`と`provider_description`は信頼済みのローカル値ではなく、外部LINE WORKS応答本文から抽出した非信頼入力である。`WebhookClient`と`OperationalLogger`の両境界で型、制御文字、長さ、応答形式との相関を検証する。provider固有の接頭辞・接尾辞を含む場合も、送信payloadのtitleまたはtextとの間に8 bytes以上の共通連続断片がある説明は例外なく保存せず`null`とする。判定は8-byte window集合を構築して各入力を一度ずつ走査し、payload長と説明長の積に比例する反復検索を避ける。残るprovider説明も外部入力として扱い、Mac consumerはC0・DEL・C1をfail-closedで拒否し、表示時にもURL、メールアドレス、hash、制御文字を再検査する。これらの多層防御によってメール内容を保存しない契約を維持する。
 
 ## 保存禁止情報
 
@@ -100,7 +100,8 @@ LINE WORKS Incoming WebhookがHTTP 500などを返した際に、メール本文
 - Webhook URL、メール本文、メールアドレス、例外メッセージがログへ混入しないことを検証する。
 - 既存形式のログをMac管理CLIが読み取れることを検証する。
 - `0600`以外のログ、`0700`以外の親、シンボリックリンク、所有者不一致を拒否する。
-- 240 KiB境界で完全JSONL行だけを保持し、最新の既存イベントと新イベントを失わず、成功後も256 KiB未満であることを検証する。compaction途中障害ではtruncate前の旧tailが残ることを検証する。
+- 240 KiB境界と改行なしpartial tailで完全JSONL行だけを保持し、最新の既存イベントと新イベントを失わず、成功後も256 KiB未満であることを検証する。固定sidecar lock下の並行writer、tempのsymlink/wrong-mode、short write、flush、rename前後の障害を注入し、置換前は旧logがbyte単位で不変、置換後は完全な新logだけになること、再起動相当の次回追記でpartial tailを回復することを検証する。
+- provider説明のASCII・日本語の接頭辞/接尾辞付きecho、無関係な通常説明、7-byte以下の共通断片、10 MiB payloadを検証する。
 - MLSTはRFC形式の任意reply textを持つ`250-...` / `250 ...` envelopeを許可しつつ、内部のfact entryを厳密に1件、完全path、`type=file`、mode `0600`へ束縛する。factを装う不正行、複数entry、偽envelopeは拒否する。
 - 全既存テストと公開リポジトリ向け秘密情報スキャンを実行する。
 
