@@ -121,7 +121,7 @@ final class OperationalLogger
         if ($value === null) {
             return null;
         }
-        $withoutControls = preg_replace('/[\x00-\x1F\x7F]/u', '', $value);
+        $withoutControls = preg_replace('/[\x00-\x1F\x7F-\x9F]/u', '', $value);
         if (!is_string($withoutControls)) {
             return null;
         }

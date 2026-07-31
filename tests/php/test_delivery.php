@@ -305,6 +305,7 @@ foreach ([
     ['provider description at 201', 'code', str_repeat('d', 201), 'text/plain', 'code', str_repeat('d', 200), 'text/plain'],
     ['content type at 100', 'code', 'description', str_repeat('t', 100), 'code', 'description', str_repeat('t', 100)],
     ['content type at 101', 'code', 'description', str_repeat('t', 101), 'code', 'description', str_repeat('t', 100)],
+    ['C1 controls', "co\u{0085}de", "desc\u{0085}ription", "text/\u{0085}plain", 'code', 'description', 'text/plain'],
 ] as [$limitCase, $code, $description, $contentType, $expectedCode, $expectedDescription, $expectedContentType]) {
     $limitResult = (new WebhookClient(
         'https://webhook.worksmobile.com/message/test-placeholder',
@@ -497,6 +498,7 @@ $loggerBoundaryCases = [
     ['description-201', 'code', str_repeat('d', 201), 'text/plain', 'code', str_repeat('d', 200), 'text/plain'],
     ['content-type-100', 'code', 'description', str_repeat('t', 100), 'code', 'description', str_repeat('t', 100)],
     ['content-type-101', 'code', 'description', str_repeat('t', 101), 'code', 'description', str_repeat('t', 100)],
+    ['C1-controls', "co\u{0085}de", "desc\u{0085}ription", "text/\u{0085}plain", 'code', 'description', 'text/plain'],
 ];
 foreach ($loggerBoundaryCases as [$label, $code, $description, $contentType]) {
     $loggerBoundary->log('failure', str_repeat('6', 64), 'http_error', 400, new WebhookDiagnostic(

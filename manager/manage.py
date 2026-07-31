@@ -1206,7 +1206,8 @@ class MailManager:
                     type(code) is str and len(code) <= 64
                     and re.search(r"[\x00-\x1f\x7f-\x9f]", code) is None))
                 or not (description is None or (
-                    type(description) is str and len(description) <= 200))
+                    type(description) is str and len(description) <= 200
+                    and re.search(r"[\x7f-\x9f]", description) is None))
                 or response_format not in {
                     "json", "invalid_json", "transport_error"
                 }
@@ -1304,6 +1305,20 @@ class MailManager:
                     text, flags=re.IGNORECASE)
                 or re.search(r"webhook[.]worksmobile[.]com", text,
                              flags=re.IGNORECASE)
+                or re.search(
+                    r"(?i)(?<![@\w.-])"
+                    r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?[.])+"
+                    r"(?:[a-z]{2,63}|xn--[a-z0-9-]{1,59})"
+                    r"(?::[0-9]{1,5})?/[^\s]*",
+                    text,
+                )
+                or re.search(
+                    r"(?<![0-9.])"
+                    r"(?:(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])[.]){3}"
+                    r"(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])"
+                    r"(?::[0-9]{1,5})?/[^\s]*",
+                    text,
+                )
                 or re.search(r"[^\s/@]+@[^\s/@]+", text)
                 or re.search(r"(?i)(?<![a-f0-9])[a-f0-9]{64}(?![a-f0-9])", text)):
             return "非表示"

@@ -1911,6 +1911,26 @@ class ManagerTest(unittest.TestCase):
         for secret in secrets:
             self.assertNotIn(secret, rendered)
 
+    def test_diagnostics_hide_bare_host_paths_without_hiding_normal_provider_text(self):
+        for secret in (
+            "private.example/path/to/secret",
+            "192.0.2.1/private/path",
+        ):
+            with self.subTest(secret=secret):
+                self.assertEqual(
+                    "非表示", MailManager._safe_webhook_diagnostic_text(secret)
+                )
+        for normal in (
+            "internal server error",
+            "E500",
+            "retry 1/2 failed",
+            "release 2026.07/path",
+        ):
+            with self.subTest(normal=normal):
+                self.assertEqual(
+                    normal, MailManager._safe_webhook_diagnostic_text(normal)
+                )
+
     def test_diagnostics_accept_attempt_count_bounded_by_log_bytes_not_consumer_cap(self):
         log_path = "/home/example/mail-lineworks/private/log/mail-notifier.jsonl"
         event = webhook_diagnostic_event(
@@ -1930,6 +1950,65 @@ class ManagerTest(unittest.TestCase):
         rendered = "\n".join(output)
         self.assertIn("ID 111111111111", rendered)
         self.assertNotIn("診断ログを安全に読み取れません", rendered)
+
+    def test_diagnostics_scan_exactly_the_last_one_thousand_lines(self):
+        log_path = "/home/example/mail-lineworks/private/log/mail-notifier.jsonl"
+        legacy_success = json.dumps({
+            "timestamp": "2026-07-29T23:09:00+00:00",
+            "outcome": "success",
+            "message_id_hash": "6" * 64,
+            "classification": "success",
+            "http_status": 200,
+        }, separators=(",", ":")).encode()
+        failure = json.dumps(
+            webhook_diagnostic_event(), separators=(",", ":")
+        ).encode()
+        config = {
+            "notification_targets": [], "notification_pinned_targets": [],
+            "command_path": "/private/mail-forward-command", "log_path": log_path,
+        }
+
+        outside_body = b"\n".join(
+            [b"malformed outside tail", *([legacy_success] * 999), failure, b""]
+        )
+        manager, _, _, _ = self.make_manager(config=config, log_body=outside_body)
+        outside = manager._latest_webhook_diagnostic(config)["webhook_diagnostic"]
+        self.assertIn("ID 111111111111", outside)
+
+        inside_body = b"\n".join(
+            [legacy_success, b"malformed inside tail", *([legacy_success] * 998),
+             failure, b""]
+        )
+        manager, _, _, _ = self.make_manager(config=config, log_body=inside_body)
+        self.assertEqual(
+            "診断ログを安全に読み取れません",
+            manager._latest_webhook_diagnostic(config)["webhook_diagnostic"],
+        )
+
+    def test_diagnostics_hide_sensitive_provider_values_in_valid_events(self):
+        log_path = "/home/example/mail-lineworks/private/log/mail-notifier.jsonl"
+        cases = (
+            ({"provider_code": "ops@example.invalid"}, "ops@example.invalid", "コード 非表示"),
+            ({"provider_description": "7" * 64}, "7" * 64, "説明 非表示"),
+            ({"provider_code": "private.example/path"}, "private.example/path", "コード 非表示"),
+            ({"provider_description": "192.0.2.1/private"},
+             "192.0.2.1/private", "説明 非表示"),
+        )
+        config = {
+            "notification_targets": [], "notification_pinned_targets": [],
+            "command_path": "/private/mail-forward-command", "log_path": log_path,
+        }
+        for overrides, secret, expected in cases:
+            with self.subTest(secret=secret):
+                event = webhook_diagnostic_event(**overrides)
+                manager, _, _, output = self.make_manager(
+                    config=config,
+                    log_body=(json.dumps(event, separators=(",", ":")) + "\n").encode(),
+                )
+                manager.show_diagnostics()
+                rendered = "\n".join(output)
+                self.assertIn(expected, rendered)
+                self.assertNotIn(secret, rendered)
 
     def test_diagnostics_accept_producer_correlated_response_metadata(self):
         log_path = "/home/example/mail-lineworks/private/log/mail-notifier.jsonl"
@@ -1951,9 +2030,6 @@ class ManagerTest(unittest.TestCase):
                 classification="invalid_parameter", http_status=400,
                 attempt_http_statuses=[400], provider_code="E400",
                 provider_description="invalid parameter",
-            ),
-            "json_c1_description": webhook_diagnostic_event(
-                classification="http_error", provider_description="invalid\u0085 parameter",
             ),
             "reporter_success": webhook_diagnostic_event(
                 outcome="success", classification="internal_error", http_status=200,
@@ -2030,6 +2106,9 @@ class ManagerTest(unittest.TestCase):
             "json_classification_mismatch": webhook_diagnostic_event(
                 classification="http_error", http_status=400,
                 attempt_http_statuses=[400], provider_description="invalid parameter",
+            ),
+            "json_c1_description": webhook_diagnostic_event(
+                classification="http_error", provider_description="invalid\u0085 parameter",
             ),
             "successful_tuple_as_failure": webhook_diagnostic_event(
                 http_status=200, attempt_http_statuses=[200], provider_code=200,

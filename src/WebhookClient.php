@@ -301,7 +301,7 @@ final class WebhookClient
         if ($value === null) {
             return null;
         }
-        $safe = trim((string) preg_replace('/[\\x00-\\x1F\\x7F]/u', '', $value));
+        $safe = trim((string) preg_replace('/[\\x00-\\x1F\\x7F-\\x9F]/u', '', $value));
         $characters = preg_split('//u', $safe, -1, PREG_SPLIT_NO_EMPTY) ?: [];
         return implode('', array_slice($characters, 0, $maximumCharacters));
     }
