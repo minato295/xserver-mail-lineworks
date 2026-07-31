@@ -19,6 +19,8 @@ _MAX_TO_BYTES = 900
 _MAX_LOG_PATH_BYTES = 4096
 _MAX_HEADER_LINE_BYTES = 997
 _MAX_SIGNED_MESSAGE_BYTES = 65535
+_MAX_WEBHOOK_DIAGNOSTIC_LOG_BYTES = 256 * 1024
+_MAX_WEBHOOK_DIAGNOSTIC_LINES = 1000
 # Fixed upper bounds for every non-configurable byte in one unfolded header
 # and in the complete re-authenticatable system message. Configurable To/log
 # bytes are added explicitly by _runtime_config_sizes().
@@ -1126,7 +1128,186 @@ class MailManager:
             "latest_log": "リモートリリース: %s" % (
                 "設定済み" if release_configured else "不明"
             ),
+            **self._latest_webhook_diagnostic(config),
         }
+
+    @staticmethod
+    def _validated_webhook_log_common(event):
+        keys = {"timestamp", "outcome", "message_id_hash", "classification", "http_status"}
+        if not isinstance(event, dict) or not keys.issubset(event):
+            raise ValueError("invalid webhook diagnostic")
+        timestamp = event["timestamp"]
+        if (type(timestamp) is not str
+                or re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[+]00:00",
+                                timestamp) is None):
+            raise ValueError("invalid webhook diagnostic")
+        try:
+            occurred_at = datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%S+00:00").replace(
+                tzinfo=timezone.utc
+            )
+        except ValueError:
+            raise ValueError("invalid webhook diagnostic") from None
+        outcome = event["outcome"]
+        classification = event["classification"]
+        classifications = {
+            "success", "invalid_payload", "invalid_parameter", "missing_parameter",
+            "invalid_webhook_url", "rate_limited", "http_error", "transport_error",
+            "forced_test_failure", "internal_error", "system_mail_suppressed",
+            "health_state_failure", "unknown", "dedup_store_failure",
+            "non_target_recipient",
+        }
+        status = event["http_status"]
+        if (outcome not in {"success", "failure", "ignored"}
+                or type(classification) is not str or classification not in classifications
+                or (status is not None
+                    and (type(status) is not int or not 100 <= status <= 599))
+                or type(event["message_id_hash"]) is not str
+                or re.fullmatch(r"[a-f0-9]{64}", event["message_id_hash"]) is None
+                or (outcome == "success" and (classification != "success" or status != 200))
+                or (outcome == "ignored"
+                    and (classification != "non_target_recipient" or status is not None))
+                or (outcome == "failure"
+                    and classification in {"success", "non_target_recipient"})):
+            raise ValueError("invalid webhook diagnostic")
+        return occurred_at
+
+    @classmethod
+    def _validated_webhook_log_event(cls, event):
+        legacy_keys = {
+            "timestamp", "outcome", "message_id_hash", "classification", "http_status",
+        }
+        diagnostic_keys = legacy_keys | {
+            "attempt_count", "attempt_http_statuses", "provider_code",
+            "provider_description", "response_format", "response_content_type",
+            "response_body_bytes", "response_body_sha256", "payload_bytes",
+            "title_characters", "text_characters", "recovered_by_retry",
+        }
+        if not isinstance(event, dict) or set(event) not in (legacy_keys, diagnostic_keys):
+            raise ValueError("invalid webhook diagnostic")
+        occurred_at = cls._validated_webhook_log_common(event)
+        if set(event) == legacy_keys:
+            return occurred_at, False
+
+        attempts = event["attempt_http_statuses"]
+        attempt_count = event["attempt_count"]
+        code = event["provider_code"]
+        description = event["provider_description"]
+        content_type = event["response_content_type"]
+        body_hash = event["response_body_sha256"]
+        integer_fields = ("response_body_bytes", "payload_bytes",
+                          "title_characters", "text_characters")
+        if (type(attempt_count) is not int or not 1 <= attempt_count <= 64
+                or not isinstance(attempts, list) or len(attempts) != attempt_count
+                or any(item is not None and (
+                    type(item) is not int or not 100 <= item <= 599) for item in attempts)
+                or not (code is None or type(code) is int or (
+                    type(code) is str and len(code) <= 64
+                    and re.search(r"[\x00-\x1f\x7f-\x9f]", code) is None))
+                or not (description is None or (
+                    type(description) is str and len(description) <= 200))
+                or event["response_format"] not in {
+                    "json", "invalid_json", "transport_error"
+                }
+                or not (content_type is None or (
+                    type(content_type) is str and len(content_type) <= 100
+                    and re.search(r"[\x00-\x1f\x7f-\x9f]", content_type) is None))
+                or any(type(event[name]) is not int
+                       or not 0 <= event[name] <= 2_147_483_647
+                       for name in integer_fields)
+                or not (body_hash is None or (
+                    type(body_hash) is str
+                    and re.fullmatch(r"[a-f0-9]{64}", body_hash) is not None))
+                or type(event["recovered_by_retry"]) is not bool
+                or event["http_status"] != attempts[-1]):
+            raise ValueError("invalid webhook diagnostic")
+        if event["response_format"] == "transport_error":
+            if (event["response_body_bytes"] != 0 or body_hash is not None
+                    or code is not None or description is not None):
+                raise ValueError("invalid webhook diagnostic")
+        elif body_hash is None:
+            raise ValueError("invalid webhook diagnostic")
+        recovered = event["recovered_by_retry"]
+        if recovered:
+            if (event["outcome"] != "success" or attempt_count < 2
+                    or attempts[-1] != 200 or all(item == 200 for item in attempts[:-1])):
+                raise ValueError("invalid webhook diagnostic")
+        elif event["outcome"] == "failure":
+            pass
+        return occurred_at, event["outcome"] == "failure" or recovered
+
+    @staticmethod
+    def _safe_webhook_diagnostic_text(value):
+        if value is None or value == "":
+            return "なし"
+        text = re.sub(r"[\x00-\x1f\x7f-\x9f]", "", str(value)).strip()
+        if (not text or re.search(r"https?://|webhook[.]worksmobile[.]com", text,
+                                  flags=re.IGNORECASE)
+                or re.search(r"[^\s/@]+@[^\s/@]+", text)
+                or re.search(r"(?i)(?<![a-f0-9])[a-f0-9]{64}(?![a-f0-9])", text)):
+            return "非表示"
+        return text
+
+    def _latest_webhook_diagnostic(self, config: dict) -> dict[str, str]:
+        fallback = {"webhook_diagnostic": "詳細診断情報なし"}
+        log_path = config.get("log_path") if isinstance(config, dict) else None
+        if log_path is None:
+            return fallback
+        try:
+            if type(log_path) is not str:
+                raise ValueError("invalid webhook diagnostic")
+            body = self.deployer.read_private_log_tail(
+                log_path, limit=_MAX_WEBHOOK_DIAGNOSTIC_LOG_BYTES, expected_mode="600"
+            )
+            if type(body) is not bytes or len(body) > _MAX_WEBHOOK_DIAGNOSTIC_LOG_BYTES:
+                raise ValueError("invalid webhook diagnostic")
+            if not body:
+                return fallback
+            if not body.endswith(b"\n") or b"\r" in body:
+                raise ValueError("invalid webhook diagnostic")
+            text = body.decode("utf-8")
+            lines = text[:-1].split("\n")[-_MAX_WEBHOOK_DIAGNOSTIC_LINES:]
+            latest = None
+
+            def strict_object(pairs):
+                result = {}
+                for key, value in pairs:
+                    if type(key) is not str or key in result:
+                        raise ValueError("invalid webhook diagnostic")
+                    result[key] = value
+                return result
+
+            def reject_constant(_value):
+                raise ValueError("invalid webhook diagnostic")
+
+            for line in lines:
+                if not line:
+                    raise ValueError("invalid webhook diagnostic")
+                event = json.loads(
+                    line, object_pairs_hook=strict_object, parse_constant=reject_constant
+                )
+                occurred_at, relevant = self._validated_webhook_log_event(event)
+                if relevant:
+                    latest = (event, occurred_at)
+            if latest is None:
+                return fallback
+            event, occurred_at = latest
+            jst = occurred_at.astimezone(timezone(timedelta(hours=9)))
+            weekday = "月火水木金土日"[jst.weekday()]
+            statuses = " → ".join(
+                "接続失敗" if status is None else str(status)
+                for status in event["attempt_http_statuses"]
+            )
+            outcome = "失敗" if event["outcome"] == "failure" else "復旧"
+            recovered = "復旧" if event["recovered_by_retry"] else "未復旧"
+            summary = (
+                f"{jst:%Y年%m月%d日}（{weekday}）{jst:%H時%M分%S秒} / {outcome} / "
+                f"HTTP {statuses} / コード {self._safe_webhook_diagnostic_text(event['provider_code'])} / "
+                f"説明 {self._safe_webhook_diagnostic_text(event['provider_description'])} / "
+                f"再試行 {recovered} / ID {event['message_id_hash'][:12]}"
+            )
+            return {"webhook_diagnostic": summary}
+        except Exception:
+            return {"webhook_diagnostic": "診断ログを安全に読み取れません"}
 
     def _default_lineworks_test(self):
         config, _config_sha256 = self._read_private_config()
@@ -1256,6 +1437,9 @@ class MailManager:
         self.output("通知対象: " + str(result.get("targets", "不明")))
         self.output("配信状態: " + str(result.get("health", "不明")))
         self.output("最新ログ: " + str(result.get("latest_log", "なし")))
+        self.output("Webhook診断: " + str(result.get(
+            "webhook_diagnostic", "詳細診断情報なし"
+        )))
 
     def send_lineworks_test(self):
         self.lineworks_test_fn()

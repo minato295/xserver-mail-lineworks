@@ -16,6 +16,7 @@ from pathlib import Path, PurePosixPath
 _MACOS_CA_FILE = "/etc/ssl/cert.pem"
 _TRUSTED_CA_OWNER_UID = 0
 _MAX_CA_FILE_SIZE = 4 * 1024 * 1024
+_MAX_PRIVATE_LOG_BYTES = 256 * 1024
 _PEM_CERTIFICATE_MARKER = b"-----BEGIN CERTIFICATE-----"
 
 
@@ -231,6 +232,45 @@ class FtpsDeployer:
             ftp.quit()
         if len(body) > limit:
             raise RuntimeError("remote readback is too large")
+        return bytes(body)
+
+    def read_private_log_tail(self, remote_path: str, *, limit: int,
+                              expected_mode: str = "600") -> bytes:
+        """Read one owner-only operational log from the fixed private tree."""
+        if (type(remote_path) is not str or type(limit) is not int
+                or limit < 0 or limit > _MAX_PRIVATE_LOG_BYTES
+                or expected_mode != "600" or self.filesystem_home is None
+                or "//" in remote_path):
+            raise ValueError("private log read request is invalid")
+        self._validate_private(remote_path)
+        filesystem_root = PurePosixPath(self.filesystem_home) / "mail-lineworks/private"
+        try:
+            relative_path = PurePosixPath(remote_path).relative_to(filesystem_root)
+        except ValueError:
+            raise ValueError("private log path is invalid") from None
+        if not relative_path.parts:
+            raise ValueError("private log path is invalid")
+        ftp_path = (PurePosixPath("/mail-lineworks/private") / relative_path).as_posix()
+        self._validate_private(ftp_path)
+
+        body = bytearray()
+
+        def receive(chunk):
+            if not isinstance(chunk, bytes) or len(body) + len(chunk) > limit:
+                raise RuntimeError("remote private log could not be read")
+            body.extend(chunk)
+
+        ftp = self._connect()
+        try:
+            try:
+                self._verify_mlst_mode(
+                    ftp.sendcmd("MLST " + ftp_path), ftp_path, expected_mode
+                )
+                ftp.retrbinary("RETR " + ftp_path, receive)
+            except (RuntimeError,) + all_errors:
+                raise RuntimeError("remote private log could not be read") from None
+        finally:
+            ftp.quit()
         return bytes(body)
 
     def read_optional_bytes(self, remote_path, *, limit):

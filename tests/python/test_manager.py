@@ -121,11 +121,15 @@ class FakeApi:
 
 
 class FakeDeployer:
-    def __init__(self, config=None, read_error=None, read_configs=None):
+    def __init__(self, config=None, read_error=None, read_configs=None,
+                 log_body=b"", log_error=None):
         self.configs = []
         self.config = dict(config or {})
         self.read_error = read_error
         self.read_configs = iter(read_configs) if read_configs is not None else None
+        self.log_body = log_body
+        self.log_error = log_error
+        self.log_reads = []
 
     def read_private_config(self):
         if self.read_error:
@@ -137,6 +141,12 @@ class FakeDeployer:
     def update_private_config(self, config):
         self.configs.append(config)
         self.config = dict(config)
+
+    def read_private_log_tail(self, remote_path, *, limit, expected_mode="600"):
+        self.log_reads.append((remote_path, limit, expected_mode))
+        if self.log_error is not None:
+            raise self.log_error
+        return self.log_body
 
     @staticmethod
     def _digest(config):
@@ -1582,12 +1592,14 @@ class ManagerTest(unittest.TestCase):
 
     def make_manager(self, answers=(), filters=(), errors=(), config=None, read_error=None,
                      now_fn=None, test_token_fn=None, read_configs=None,
-                     initial_command_path=None):
+                     initial_command_path=None, log_body=b"", log_error=None):
         output = []
         api = FakeApi(filters)
         if config is None and errors:
             config = {"error_recipients": list(errors)}
-        deployer = FakeDeployer(config, read_error, read_configs)
+        deployer = FakeDeployer(
+            config, read_error, read_configs, log_body=log_body, log_error=log_error
+        )
         answers = iter(answers)
         manager = MailManager(
             api,
@@ -1743,6 +1755,136 @@ class ManagerTest(unittest.TestCase):
                         "private-token", message_hash,
                         "/private/releases/private-release-id"):
             self.assertNotIn(private, rendered)
+
+    def test_diagnostics_display_latest_safe_webhook_failure(self):
+        log_path = "/home/example/mail-lineworks/private/log/mail-notifier.jsonl"
+        message_hash = "2ec3d48e5880d38a37b822b8e2fd8af1fc91070e97341b9776a19438264f672d"
+        response_hash = "f" * 64
+        failure = {
+            "timestamp": "2026-07-29T23:10:49+00:00",
+            "outcome": "failure",
+            "message_id_hash": message_hash,
+            "classification": "http_error",
+            "http_status": 500,
+            "attempt_count": 2,
+            "attempt_http_statuses": [500, 500],
+            "provider_code": "E500",
+            "provider_description": "internal\u0000 server error",
+            "response_format": "json",
+            "response_content_type": "application/json; charset=UTF-8",
+            "response_body_bytes": 84,
+            "response_body_sha256": response_hash,
+            "payload_bytes": 512,
+            "title_characters": 12,
+            "text_characters": 250,
+            "recovered_by_retry": False,
+        }
+        later_legacy_success = {
+            "timestamp": "2026-07-29T23:11:00+00:00",
+            "outcome": "success",
+            "message_id_hash": "a" * 64,
+            "classification": "success",
+            "http_status": 200,
+        }
+        log_body = (json.dumps(failure, ensure_ascii=False, separators=(",", ":")) + "\n"
+                    + json.dumps(later_legacy_success, separators=(",", ":")) + "\n").encode()
+        config = {
+            "notification_targets": [], "notification_pinned_targets": [],
+            "command_path": "/private/mail-forward-command", "log_path": log_path,
+        }
+        manager, _, deployer, output = self.make_manager(config=config, log_body=log_body)
+
+        manager.show_diagnostics()
+
+        expected = (
+            "Webhook診断: 2026年07月30日（木）08時10分49秒 / 失敗 / "
+            "HTTP 500 → 500 / コード E500 / 説明 internal server error / "
+            "再試行 未復旧 / ID 2ec3d48e5880"
+        )
+        self.assertIn(expected, output)
+        self.assertEqual([(log_path, 256 * 1024, "600")], deployer.log_reads)
+        rendered = "\n".join(output)
+        for private in (message_hash, response_hash):
+            self.assertNotIn(private, rendered)
+
+    def test_diagnostics_display_no_details_for_legacy_webhook_log(self):
+        log_path = "/home/example/mail-lineworks/private/log/mail-notifier.jsonl"
+        legacy = {
+            "timestamp": "2026-07-29T23:10:49+00:00",
+            "outcome": "failure",
+            "message_id_hash": "b" * 64,
+            "classification": "transport_error",
+            "http_status": None,
+        }
+        config = {
+            "notification_targets": [], "notification_pinned_targets": [],
+            "command_path": "/private/mail-forward-command", "log_path": log_path,
+        }
+        manager, _, _, output = self.make_manager(
+            config=config,
+            log_body=(json.dumps(legacy, separators=(",", ":")) + "\n").encode(),
+        )
+
+        manager.show_diagnostics()
+
+        self.assertIn("Webhook診断: 詳細診断情報なし", output)
+        self.assertNotIn("b" * 64, "\n".join(output))
+
+    def test_diagnostics_fail_closed_for_invalid_or_unreadable_webhook_log(self):
+        log_path = "/home/example/mail-lineworks/private/log/mail-notifier.jsonl"
+        invalid = {
+            "timestamp": "2026-07-29T23:10:49+00:00",
+            "outcome": "failure",
+            "message_id_hash": "c" * 64,
+            "classification": "http_error",
+            "http_status": 500,
+            "recipient": "private@example.invalid",
+            "webhook_url": "https://webhook.worksmobile.com/message/private-token",
+        }
+        config = {
+            "notification_targets": [], "notification_pinned_targets": [],
+            "command_path": "/private/mail-forward-command", "log_path": log_path,
+        }
+        cases = (
+            {
+                "log_body": (json.dumps(invalid, separators=(",", ":")) + "\n").encode(),
+                "log_error": None,
+            },
+            {
+                "log_body": (
+                    b'{"timestamp":"2026-07-29T23:10:49+00:00",'
+                    b'"outcome":"failure","message_id_hash":"'
+                    + b"e" * 64
+                    + b'","classification":"http_error","http_status":500,'
+                    b'"attempt_count":1,"attempt_http_statuses":[500],'
+                    b'"provider_code":"E500","provider_description":"first",'
+                    b'"provider_description":"second","response_format":"json",'
+                    b'"response_content_type":"application/json",'
+                    b'"response_body_bytes":2,"response_body_sha256":"'
+                    + b"f" * 64
+                    + b'","payload_bytes":10,"title_characters":1,'
+                    b'"text_characters":1,"recovered_by_retry":false}\n'
+                ),
+                "log_error": None,
+            },
+            {
+                "log_body": b"",
+                "log_error": RuntimeError(
+                    "0644 private@example.invalid private-token " + "d" * 64
+                ),
+            },
+        )
+        for case in cases:
+            with self.subTest(error=case["log_error"] is not None):
+                manager, _, _, output = self.make_manager(config=config, **case)
+                manager.show_diagnostics()
+                rendered = "\n".join(output)
+                self.assertIn("Webhook診断: 診断ログを安全に読み取れません", output)
+                for private in (
+                    "private@example.invalid", "private-token", "c" * 64, "d" * 64,
+                    "e" * 64, "f" * 64,
+                ):
+                    self.assertNotIn(private, rendered)
 
     def test_diagnostics_report_missing_healthy_and_degraded_health_in_japanese(self):
         cases = (
