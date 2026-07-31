@@ -20,14 +20,19 @@ final class OperationalLogger
         'non_target_recipient',
     ];
     private const RESPONSE_FORMATS = ['json', 'invalid_json', 'transport_error'];
+    private const MAX_DIAGNOSTIC_INTEGER = 2_147_483_647;
+    private const MAX_LOG_BYTES = 240 * 1024;
+    private const MAX_EVENT_BYTES = 120 * 1024;
 
     private readonly Closure $utcClock;
     private readonly Closure $effectiveUid;
+    private readonly ?Closure $beforeCompactionTruncate;
 
     public function __construct(
         private readonly string $path,
         ?callable $utcClock = null,
         ?callable $effectiveUid = null,
+        ?callable $beforeCompactionTruncate = null,
     ) {
         $this->utcClock = Closure::fromCallable(
             $utcClock ?? static fn (): DateTimeImmutable => new DateTimeImmutable('now', new DateTimeZone('UTC')),
@@ -38,6 +43,8 @@ final class OperationalLogger
             }
             return posix_geteuid();
         });
+        $this->beforeCompactionTruncate = $beforeCompactionTruncate === null
+            ? null : Closure::fromCallable($beforeCompactionTruncate);
     }
 
     public function log(
@@ -48,12 +55,12 @@ final class OperationalLogger
         ?WebhookDiagnostic $diagnostic = null,
     ): void
     {
+        $this->assertCommonContract($outcome, $classification, $httpStatus, $diagnostic !== null);
         $now = ($this->utcClock)();
         if (!$now instanceof DateTimeImmutable) {
             throw new RuntimeException('Operational log unavailable');
         }
-        $safeClassification = in_array($classification, self::CLASSIFICATIONS, true)
-            ? $classification : 'unknown';
+        $safeClassification = $classification;
         $event = [
             'timestamp' => $now->setTimezone(new DateTimeZone('UTC'))->format(DATE_ATOM),
             'outcome' => $outcome,
@@ -62,21 +69,19 @@ final class OperationalLogger
             'http_status' => $httpStatus,
         ];
         if ($diagnostic !== null) {
-            $lastRelevant = $this->lastRelevantAttempt($diagnostic, $outcome);
-            if (!in_array($lastRelevant->responseFormat, self::RESPONSE_FORMATS, true)) {
-                throw new RuntimeException('Operational log unavailable');
-            }
+            [$attempts, $lastRelevant, $safeClassification] = $this->validatedDiagnostic(
+                $diagnostic, $outcome, $classification, $httpStatus,
+            );
+            $event['classification'] = $safeClassification;
             $event += [
-                'attempt_count' => count($diagnostic->attempts),
-                'attempt_http_statuses' => $diagnostic->attemptHttpStatuses(),
-                'provider_code' => is_string($lastRelevant->providerCode)
-                    ? $this->safeText($lastRelevant->providerCode, 64) : $lastRelevant->providerCode,
-                'provider_description' => $this->safeText($lastRelevant->providerDescription, 200),
-                'response_format' => $lastRelevant->responseFormat,
-                'response_content_type' => $this->safeText($lastRelevant->responseContentType, 100),
-                'response_body_bytes' => $lastRelevant->responseBodyBytes,
-                'response_body_sha256' => preg_match('/\A[a-f0-9]{64}\z/D', $lastRelevant->responseBodySha256 ?? '') === 1
-                    ? $lastRelevant->responseBodySha256 : null,
+                'attempt_count' => count($attempts),
+                'attempt_http_statuses' => array_column($attempts, 'http_status'),
+                'provider_code' => $lastRelevant['provider_code'],
+                'provider_description' => $lastRelevant['provider_description'],
+                'response_format' => $lastRelevant['response_format'],
+                'response_content_type' => $lastRelevant['response_content_type'],
+                'response_body_bytes' => $lastRelevant['response_body_bytes'],
+                'response_body_sha256' => $lastRelevant['response_body_sha256'],
                 'payload_bytes' => $diagnostic->payloadBytes,
                 'title_characters' => $diagnostic->titleCharacters,
                 'text_characters' => $diagnostic->textCharacters,
@@ -84,36 +89,207 @@ final class OperationalLogger
             ];
         }
         $line = json_encode($event, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES) . "\n";
+        if (strlen($line) > self::MAX_EVENT_BYTES) {
+            throw new RuntimeException('Operational log unavailable');
+        }
         $this->append($line);
     }
 
-    private function lastRelevantAttempt(WebhookDiagnostic $diagnostic, string $outcome): WebhookAttemptDiagnostic
+    private function assertCommonContract(
+        string $outcome,
+        string $classification,
+        ?int $httpStatus,
+        bool $hasDiagnostic,
+    ): void
     {
-        $last = $diagnostic->attempts[array_key_last($diagnostic->attempts)] ?? null;
-        if (!$last instanceof WebhookAttemptDiagnostic) {
+        if (!in_array($outcome, ['success', 'failure', 'ignored'], true)
+            || !in_array($classification, self::CLASSIFICATIONS, true)
+            || ($httpStatus !== null && ($httpStatus < 100 || $httpStatus > 599))) {
             throw new RuntimeException('Operational log unavailable');
         }
-        if ($outcome !== 'success' || count($diagnostic->attempts) === 1) {
-            return $last;
+        if ($outcome === 'ignored') {
+            if ($classification !== 'non_target_recipient' || $httpStatus !== null || $hasDiagnostic) {
+                throw new RuntimeException('Operational log unavailable');
+            }
+            return;
         }
-        for ($index = count($diagnostic->attempts) - 1; $index >= 0; --$index) {
-            $attempt = $diagnostic->attempts[$index];
+        if ($outcome === 'success') {
+            if ($hasDiagnostic) {
+                if (!in_array($classification, ['success', 'internal_error'], true) || $httpStatus !== 200) {
+                    throw new RuntimeException('Operational log unavailable');
+                }
+            } elseif (!(($classification === 'success' && $httpStatus === 200)
+                || ($classification === 'system_mail_suppressed' && $httpStatus === null))) {
+                throw new RuntimeException('Operational log unavailable');
+            }
+            return;
+        }
+        if (in_array($classification, ['success', 'non_target_recipient'], true)) {
+            throw new RuntimeException('Operational log unavailable');
+        }
+    }
+
+    /**
+     * @return array{0:list<array<string,mixed>>,1:array<string,mixed>,2:string}
+     */
+    private function validatedDiagnostic(
+        WebhookDiagnostic $diagnostic,
+        string $outcome,
+        string $classification,
+        ?int $httpStatus,
+    ): array
+    {
+        if (!array_is_list($diagnostic->attempts) || $diagnostic->attempts === []
+            || !$this->isBoundedInteger($diagnostic->payloadBytes)
+            || !$this->isBoundedInteger($diagnostic->titleCharacters)
+            || !$this->isBoundedInteger($diagnostic->textCharacters)) {
+            throw new RuntimeException('Operational log unavailable');
+        }
+        $attempts = [];
+        foreach ($diagnostic->attempts as $attempt) {
             if (!$attempt instanceof WebhookAttemptDiagnostic) {
                 throw new RuntimeException('Operational log unavailable');
             }
-            if (!$this->isSuccessfulAttempt($attempt)) {
-                return $attempt;
+            $attempts[] = $this->validatedAttempt($attempt);
+        }
+        $lastIndex = array_key_last($attempts);
+        if (!is_int($lastIndex) || $httpStatus !== $attempts[$lastIndex]['http_status']) {
+            throw new RuntimeException('Operational log unavailable');
+        }
+        foreach (array_slice($attempts, 0, -1) as $attempt) {
+            if ($attempt['http_status'] === null) {
+                throw new RuntimeException('Operational log unavailable');
             }
         }
-        return $last;
+
+        $recovered = false;
+        for ($index = 0; $index + 1 < count($attempts); ++$index) {
+            $status = $attempts[$index]['http_status'];
+            if (($status === 429 || (is_int($status) && $status >= 500 && $status <= 599))
+                && $this->isSuccessfulAttempt($attempts[$index + 1])) {
+                $recovered = true;
+                break;
+            }
+        }
+        if ($diagnostic->recoveredByRetry !== $recovered) {
+            throw new RuntimeException('Operational log unavailable');
+        }
+
+        $relevantIndex = $lastIndex;
+        if ($outcome === 'success' && count($attempts) > 1) {
+            for ($index = $lastIndex; $index >= 0; --$index) {
+                if (!$this->isSuccessfulAttempt($attempts[$index])) {
+                    $relevantIndex = $index;
+                    break;
+                }
+            }
+        }
+        $relevant = $attempts[$relevantIndex];
+        if ($outcome === 'failure') {
+            if ($this->isSuccessfulAttempt($relevant)) {
+                throw new RuntimeException('Operational log unavailable');
+            }
+            $expectedClassification = $this->attemptClassification($relevant);
+            if ($relevant['response_format'] === 'json'
+                && $relevant['provider_description'] === null
+                && in_array($classification, [
+                    'invalid_parameter', 'missing_parameter', 'invalid_webhook_url', 'rate_limited',
+                ], true)) {
+                $classification = 'http_error';
+            }
+            if ($classification !== $expectedClassification) {
+                throw new RuntimeException('Operational log unavailable');
+            }
+        } elseif (count($attempts) === 1) {
+            if (!$this->isSuccessfulAttempt($attempts[0]) || $diagnostic->recoveredByRetry) {
+                throw new RuntimeException('Operational log unavailable');
+            }
+        } else {
+            if (!$this->isSuccessfulAttempt($attempts[$lastIndex]) || $relevantIndex === $lastIndex) {
+                throw new RuntimeException('Operational log unavailable');
+            }
+            if (!$diagnostic->recoveredByRetry) {
+                if ($relevantIndex !== 0 || $this->attemptClassification($relevant) !== 'invalid_parameter') {
+                    throw new RuntimeException('Operational log unavailable');
+                }
+                foreach (array_slice($attempts, 1) as $attempt) {
+                    if (!$this->isSuccessfulAttempt($attempt)) {
+                        throw new RuntimeException('Operational log unavailable');
+                    }
+                }
+            }
+        }
+        return [$attempts, $relevant, $classification];
     }
 
-    private function isSuccessfulAttempt(WebhookAttemptDiagnostic $attempt): bool
+    /** @return array<string,mixed> */
+    private function validatedAttempt(WebhookAttemptDiagnostic $attempt): array
     {
-        return $attempt->httpStatus === 200
-            && $attempt->providerCode === 200
-            && $attempt->providerDescription === 'success'
-            && $attempt->responseFormat === 'json';
+        $status = $attempt->httpStatus;
+        $format = $attempt->responseFormat;
+        $code = is_string($attempt->providerCode)
+            ? $this->safeText($attempt->providerCode, 64) : $attempt->providerCode;
+        $description = $this->safeText($attempt->providerDescription, 200);
+        $contentType = $this->safeText($attempt->responseContentType, 100);
+        $bodyHash = $attempt->responseBodySha256;
+        if (($status !== null && ($status < 100 || $status > 599))
+            || !in_array($format, self::RESPONSE_FORMATS, true)
+            || !$this->isBoundedInteger($attempt->responseBodyBytes)
+            || ($bodyHash !== null && preg_match('/\A[a-f0-9]{64}\z/D', $bodyHash) !== 1)) {
+            throw new RuntimeException('Operational log unavailable');
+        }
+        if ($format === 'transport_error') {
+            if ($status !== null || $code !== null || $description !== null || $contentType !== null
+                || $attempt->responseBodyBytes !== 0 || $bodyHash !== null) {
+                throw new RuntimeException('Operational log unavailable');
+            }
+        } else {
+            if ($status === null || $bodyHash === null) {
+                throw new RuntimeException('Operational log unavailable');
+            }
+            if ($format === 'invalid_json' && ($code !== null || $description !== null)) {
+                throw new RuntimeException('Operational log unavailable');
+            }
+        }
+        return [
+            'http_status' => $status,
+            'provider_code' => $code,
+            'provider_description' => $description,
+            'response_format' => $format,
+            'response_content_type' => $contentType,
+            'response_body_bytes' => $attempt->responseBodyBytes,
+            'response_body_sha256' => $bodyHash,
+        ];
+    }
+
+    /** @param array<string,mixed> $attempt */
+    private function isSuccessfulAttempt(array $attempt): bool
+    {
+        return $attempt['http_status'] === 200
+            && $attempt['provider_code'] === 200
+            && $attempt['provider_description'] === 'success'
+            && $attempt['response_format'] === 'json';
+    }
+
+    /** @param array<string,mixed> $attempt */
+    private function attemptClassification(array $attempt): string
+    {
+        return match ($attempt['response_format']) {
+            'transport_error' => 'transport_error',
+            'invalid_json' => 'http_error',
+            default => match ($attempt['provider_description']) {
+                'invalid parameter' => 'invalid_parameter',
+                'missing parameter' => 'missing_parameter',
+                'invalid webhook URL' => 'invalid_webhook_url',
+                'too many request' => 'rate_limited',
+                default => 'http_error',
+            },
+        };
+    }
+
+    private function isBoundedInteger(int $value): bool
+    {
+        return $value >= 0 && $value <= self::MAX_DIAGNOSTIC_INTEGER;
     }
 
     private function safeText(?string $value, int $maximumCharacters): ?string
@@ -179,22 +355,50 @@ final class OperationalLogger
             }
             $this->assertOpenedFile($path, $fileHandle, $owner);
             $this->assertDirectory($directory, $directoryHandle, $directoryStat, $owner);
-            if (fseek($fileHandle, 0, SEEK_END) !== 0) {
+            $opened = fstat($fileHandle);
+            if (!is_array($opened) || !is_int($opened['size'] ?? null) || $opened['size'] < 0) {
                 throw new RuntimeException('Operational log unavailable');
             }
-            $offset = 0;
-            while ($offset < strlen($line)) {
-                $written = fwrite($fileHandle, substr($line, $offset));
-                if (!is_int($written) || $written < 1) {
+            $expectedSize = $opened['size'] + strlen($line);
+            if ($expectedSize <= self::MAX_LOG_BYTES) {
+                if (fseek($fileHandle, 0, SEEK_END) !== 0) {
                     throw new RuntimeException('Operational log unavailable');
                 }
-                $offset += $written;
-            }
-            if (!fflush($fileHandle)) {
-                throw new RuntimeException('Operational log unavailable');
+                $this->writeAll($fileHandle, $line);
+                if (!fflush($fileHandle)) {
+                    throw new RuntimeException('Operational log unavailable');
+                }
+            } else {
+                $retained = $this->compactedTail(
+                    $fileHandle,
+                    $opened['size'],
+                    self::MAX_LOG_BYTES - strlen($line),
+                );
+                $compacted = $retained . $line;
+                $expectedSize = strlen($compacted);
+                if ($expectedSize > self::MAX_LOG_BYTES || fseek($fileHandle, 0, SEEK_SET) !== 0) {
+                    throw new RuntimeException('Operational log unavailable');
+                }
+                $this->writeAll($fileHandle, $compacted);
+                if (!fflush($fileHandle)) {
+                    throw new RuntimeException('Operational log unavailable');
+                }
+                $this->assertOpenedFile($path, $fileHandle, $owner);
+                $this->assertDirectory($directory, $directoryHandle, $directoryStat, $owner);
+                if ($this->beforeCompactionTruncate !== null) {
+                    ($this->beforeCompactionTruncate)();
+                }
+                if (!ftruncate($fileHandle, $expectedSize) || !fflush($fileHandle)) {
+                    throw new RuntimeException('Operational log unavailable');
+                }
             }
             $this->assertOpenedFile($path, $fileHandle, $owner);
             $this->assertDirectory($directory, $directoryHandle, $directoryStat, $owner);
+            $completed = fstat($fileHandle);
+            if (!is_array($completed) || ($completed['size'] ?? -1) !== $expectedSize
+                || $expectedSize > self::MAX_LOG_BYTES) {
+                throw new RuntimeException('Operational log unavailable');
+            }
         } catch (Throwable $error) {
             throw new RuntimeException('Operational log unavailable', 0, $error);
         } finally {
@@ -206,6 +410,86 @@ final class OperationalLogger
                 fclose($directoryHandle);
             }
         }
+    }
+
+    /** @param resource $handle */
+    private function writeAll($handle, string $bytes): void
+    {
+        $offset = 0;
+        while ($offset < strlen($bytes)) {
+            $written = fwrite($handle, substr($bytes, $offset));
+            if (!is_int($written) || $written < 1) {
+                throw new RuntimeException('Operational log unavailable');
+            }
+            $offset += $written;
+        }
+    }
+
+    /** @param resource $handle */
+    private function compactedTail($handle, int $size, int $budget): string
+    {
+        if ($budget < self::MAX_EVENT_BYTES) {
+            throw new RuntimeException('Operational log unavailable');
+        }
+        $readBytes = min($size, self::MAX_LOG_BYTES);
+        $start = $size - $readBytes;
+        if (fseek($handle, $start, SEEK_SET) !== 0) {
+            throw new RuntimeException('Operational log unavailable');
+        }
+        $tail = '';
+        while (strlen($tail) < $readBytes) {
+            $chunk = fread($handle, $readBytes - strlen($tail));
+            if (!is_string($chunk) || $chunk === '') {
+                throw new RuntimeException('Operational log unavailable');
+            }
+            $tail .= $chunk;
+        }
+        if ($start > 0) {
+            $firstBoundary = strpos($tail, "\n");
+            if ($firstBoundary === false) {
+                throw new RuntimeException('Operational log unavailable');
+            }
+            $tail = substr($tail, $firstBoundary + 1);
+        }
+        $lastBoundary = strrpos($tail, "\n");
+        if ($lastBoundary === false) {
+            if ($start > 0) {
+                throw new RuntimeException('Operational log unavailable');
+            }
+            return '';
+        }
+        $lines = explode("\n", substr($tail, 0, $lastBoundary));
+        $selected = [];
+        $selectedBytes = 0;
+        $foundValid = false;
+        for ($index = count($lines) - 1; $index >= 0; --$index) {
+            $candidate = $lines[$index];
+            if ($candidate === '' || preg_match('//u', $candidate) !== 1) {
+                continue;
+            }
+            try {
+                $decoded = json_decode($candidate, false, 32, JSON_THROW_ON_ERROR);
+            } catch (Throwable) {
+                continue;
+            }
+            if (!$decoded instanceof \stdClass) {
+                continue;
+            }
+            $record = $candidate . "\n";
+            if (!$foundValid && strlen($record) > $budget) {
+                throw new RuntimeException('Operational log unavailable');
+            }
+            $foundValid = true;
+            if ($selectedBytes + strlen($record) > $budget) {
+                break;
+            }
+            array_unshift($selected, $record);
+            $selectedBytes += strlen($record);
+        }
+        if (!$foundValid && $start > 0) {
+            throw new RuntimeException('Operational log unavailable');
+        }
+        return implode('', $selected);
     }
 
     /** @param resource $handle @param array<string,int>|false $original */

@@ -1793,7 +1793,7 @@ class ManagerTest(unittest.TestCase):
             "attempt_count": 2,
             "attempt_http_statuses": [500, 500],
             "provider_code": "E500",
-            "provider_description": "internal\u0000 server error",
+            "provider_description": "internal server error",
             "response_format": "json",
             "response_content_type": "application/json; charset=UTF-8",
             "response_body_bytes": 84,
@@ -1930,6 +1930,14 @@ class ManagerTest(unittest.TestCase):
                 self.assertEqual(
                     normal, MailManager._safe_webhook_diagnostic_text(normal)
                 )
+
+    def test_diagnostics_display_sanitizer_restrips_all_control_ranges(self):
+        self.assertEqual(
+            "internal server error",
+            MailManager._safe_webhook_diagnostic_text(
+                "internal\u0000\u001f\u007f\u0085 server error"
+            ),
+        )
 
     def test_diagnostics_accept_attempt_count_bounded_by_log_bytes_not_consumer_cap(self):
         log_path = "/home/example/mail-lineworks/private/log/mail-notifier.jsonl"
@@ -2106,6 +2114,12 @@ class ManagerTest(unittest.TestCase):
             "json_classification_mismatch": webhook_diagnostic_event(
                 classification="http_error", http_status=400,
                 attempt_http_statuses=[400], provider_description="invalid parameter",
+            ),
+            "json_c0_description": webhook_diagnostic_event(
+                classification="http_error", provider_description="server\u0001 error",
+            ),
+            "json_del_description": webhook_diagnostic_event(
+                classification="http_error", provider_description="invalid\u007f parameter",
             ),
             "json_c1_description": webhook_diagnostic_event(
                 classification="http_error", provider_description="invalid\u0085 parameter",

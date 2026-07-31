@@ -274,6 +274,67 @@ deliveryCheck(
 );
 deliveryCheck($serverSleeps === [5], 'HTTP 5xx retry must wait before retrying');
 
+foreach ([
+    ['429-then-500', [
+        response(429, 'too many request', ['RateLimit-Reset' => '1']),
+        response(500, 'server error'),
+    ], [1], [429, 500]],
+    ['500-then-429', [
+        response(500, 'server error'),
+        response(429, 'too many request', ['RateLimit-Reset' => '1']),
+    ], [5], [500, 429]],
+] as [$label, $responses, $expectedSleeps, $expectedStatuses]) {
+    $crossCalls = 0;
+    $crossSleeps = [];
+    $crossClient = new WebhookClient(
+        'https://webhook.worksmobile.com/message/test-placeholder',
+        static function () use (&$crossCalls, &$responses): array {
+            ++$crossCalls;
+            return array_shift($responses);
+        },
+        256,
+        static function (int $seconds) use (&$crossSleeps): void { $crossSleeps[] = $seconds; },
+    );
+    $crossResult = $crossClient->send('Title', 'Text');
+    deliveryCheck(!$crossResult->isSuccess() && $crossCalls === 2,
+        $label . ' must stop after two identical-payload sends');
+    deliveryCheck($crossSleeps === $expectedSleeps,
+        $label . ' must sleep only for the initial retry transition');
+    deliveryCheck($crossResult->diagnostic?->attemptHttpStatuses() === $expectedStatuses,
+        $label . ' must retain exactly two state-machine attempts');
+}
+
+foreach ([null, '-1', '16', '1.5'] as $invalidReset) {
+    $invalidResetCalls = 0;
+    $headers = $invalidReset === null ? [] : ['RateLimit-Reset' => $invalidReset];
+    $invalidResetClient = new WebhookClient(
+        'https://webhook.worksmobile.com/message/test-placeholder',
+        static function () use (&$invalidResetCalls, $headers): array {
+            ++$invalidResetCalls;
+            return response(429, 'too many request', $headers);
+        },
+        256,
+        static function (): void { throw new RuntimeException('Invalid reset must not sleep'); },
+    );
+    deliveryCheck(!$invalidResetClient->send('Title', 'Text')->isSuccess()
+        && $invalidResetCalls === 1, 'Invalid RateLimit-Reset must not transition to retry');
+}
+
+$echoedDescription = 'private payload fragment';
+$echoResult = (new WebhookClient(
+    'https://webhook.worksmobile.com/message/test-placeholder',
+    static fn (): array => response(400, $echoedDescription),
+))->send('Title', 'Prefix ' . $echoedDescription . ' suffix');
+deliveryCheck($echoResult->diagnostic?->attempts[0]->providerDescription === null,
+    'Provider description that directly echoes an 8+ character payload fragment must not be retained');
+
+$shortEchoResult = (new WebhookClient(
+    'https://webhook.worksmobile.com/message/test-placeholder',
+    static fn (): array => response(400, 'seven77'),
+))->send('Title', 'Prefix seven77 suffix');
+deliveryCheck($shortEchoResult->diagnostic?->attempts[0]->providerDescription === 'seven77',
+    'Provider description shorter than eight characters must remain diagnostically useful');
+
 $diagnosticResponses = [
     [
         'status' => 500,
@@ -400,6 +461,15 @@ $logDirectory = realpath($logDirectory);
 deliveryCheck(is_string($logDirectory), 'Operational log fixture directory must resolve');
 $logPath = $logDirectory . '/operational.jsonl';
 $logger = new OperationalLogger($logPath);
+$echoLogPath = $logDirectory . '/provider-echo.jsonl';
+(new OperationalLogger($echoLogPath))->log(
+    'failure', str_repeat('9', 64), $echoResult->classification,
+    $echoResult->httpStatus, $echoResult->diagnostic,
+);
+$echoLogBytes = (string) file_get_contents($echoLogPath);
+deliveryCheck(!str_contains($echoLogBytes, $echoedDescription)
+    && str_contains($echoLogBytes, '"provider_description":null'),
+    'Direct provider echo of a payload fragment must not reach persistent diagnostics');
 $logger->log('success', str_repeat('0', 64), 'success', 200);
 $logger->log(
     'success', str_repeat('1', 64), 'success', 200, $diagnosticResult->diagnostic,
@@ -540,6 +610,189 @@ try {
 deliveryCheck((string) file_get_contents($loggerBoundaryPath) === $beforeInvalidFormat,
     'Rejected response format must not append any part of an event');
 
+$validBodyHash = hash('sha256', 'diagnostic response');
+$strictLoggerCases = [
+    ['unknown-outcome', 'other', 'http_error', 400, null],
+    ['unknown-classification', 'failure', 'not_allowlisted', 400, null],
+    ['status-below-http-range', 'failure', 'http_error', 99, null],
+    ['success-outcome-mismatch', 'success', 'http_error', 500, null],
+    ['ignored-outcome-mismatch', 'ignored', 'http_error', null, null],
+    ['attempt-status-below-range', 'failure', 'http_error', 99, new WebhookDiagnostic(
+        [new WebhookAttemptDiagnostic(99, 'E99', 'server error', 'json', 'application/json', 2, $validBodyHash)],
+        10, 3, 4, false,
+    )],
+    ['negative-response-bytes', 'failure', 'http_error', 500, new WebhookDiagnostic(
+        [new WebhookAttemptDiagnostic(500, 'E500', 'server error', 'json', 'application/json', -1, $validBodyHash)],
+        10, 3, 4, false,
+    )],
+    ['negative-payload-bytes', 'failure', 'http_error', 500, new WebhookDiagnostic(
+        [new WebhookAttemptDiagnostic(500, 'E500', 'server error', 'json', 'application/json', 2, $validBodyHash)],
+        -1, 3, 4, false,
+    )],
+    ['transport-with-metadata', 'failure', 'transport_error', null, new WebhookDiagnostic(
+        [new WebhookAttemptDiagnostic(null, 'secret', null, 'transport_error', null, 0, null)],
+        10, 3, 4, false,
+    )],
+    ['invalid-json-with-provider-code', 'failure', 'http_error', 502, new WebhookDiagnostic(
+        [new WebhookAttemptDiagnostic(502, 'E502', null, 'invalid_json', 'text/plain', 2, $validBodyHash)],
+        10, 3, 4, false,
+    )],
+    ['json-without-body-hash', 'failure', 'http_error', 500, new WebhookDiagnostic(
+        [new WebhookAttemptDiagnostic(500, 'E500', 'server error', 'json', 'application/json', 2, null)],
+        10, 3, 4, false,
+    )],
+    ['recovered-without-retryable-transition', 'success', 'success', 200, new WebhookDiagnostic(
+        [
+            new WebhookAttemptDiagnostic(400, 'E400', 'invalid parameter', 'json', 'application/json', 2, $validBodyHash),
+            new WebhookAttemptDiagnostic(200, 200, 'success', 'json', 'application/json', 2, $validBodyHash),
+        ],
+        10, 3, 4, true,
+    )],
+    ['failure-with-success-tuple', 'failure', 'success', 200, new WebhookDiagnostic(
+        [new WebhookAttemptDiagnostic(200, 200, 'success', 'json', 'application/json', 2, $validBodyHash)],
+        10, 3, 4, false,
+    )],
+    ['event-status-does-not-match-last-attempt', 'failure', 'http_error', 500, new WebhookDiagnostic(
+        [new WebhookAttemptDiagnostic(400, 'E400', 'server error', 'json', 'application/json', 2, $validBodyHash)],
+        10, 3, 4, false,
+    )],
+    ['transport-before-later-http-attempt', 'failure', 'http_error', 500, new WebhookDiagnostic(
+        [
+            new WebhookAttemptDiagnostic(null, null, null, 'transport_error', null, 0, null),
+            new WebhookAttemptDiagnostic(500, 'E500', 'server error', 'json', 'application/json', 2, $validBodyHash),
+        ],
+        10, 3, 4, false,
+    )],
+];
+foreach ($strictLoggerCases as [$label, $outcome, $classification, $status, $diagnostic]) {
+    $beforeRejectedDiagnostic = (string) file_get_contents($loggerBoundaryPath);
+    try {
+        $loggerBoundary->log(
+            $outcome, str_repeat('8', 64), $classification, $status, $diagnostic,
+        );
+        throw new RuntimeException($label . ' was accepted');
+    } catch (RuntimeException $exception) {
+        deliveryCheck($exception->getMessage() !== $label . ' was accepted',
+            $label . ' must be rejected by the operational logging boundary');
+    }
+    deliveryCheck((string) file_get_contents($loggerBoundaryPath) === $beforeRejectedDiagnostic,
+        $label . ' must not append any event bytes');
+}
+
+$fixedLogClock = static fn (): DateTimeImmutable => new DateTimeImmutable('2026-07-31T00:00:00+00:00');
+$templateLogPath = $logDirectory . '/bounded-template.jsonl';
+(new OperationalLogger($templateLogPath, $fixedLogClock))->log(
+    'success', str_repeat('a', 64), 'success', 200,
+);
+$boundedNewLine = (string) file_get_contents($templateLogPath);
+$boundedMaximum = 240 * 1024;
+$exactExistingBytes = $boundedMaximum - strlen($boundedNewLine);
+$objectOverhead = strlen("{\"padding\":\"\"}\n");
+$exactExistingLine = json_encode([
+    'padding' => str_repeat('x', $exactExistingBytes - $objectOverhead),
+], JSON_THROW_ON_ERROR) . "\n";
+deliveryCheck(strlen($exactExistingLine) === $exactExistingBytes,
+    'Exact bounded-log fixture must have its hand-calculated byte length');
+$exactBoundaryPath = $logDirectory . '/bounded-exact.jsonl';
+file_put_contents($exactBoundaryPath, $exactExistingLine);
+chmod($exactBoundaryPath, 0600);
+(new OperationalLogger($exactBoundaryPath, $fixedLogClock))->log(
+    'success', str_repeat('a', 64), 'success', 200,
+);
+deliveryCheck(filesize($exactBoundaryPath) === $boundedMaximum,
+    'Operational log may reach but never exceed the 240 KiB server bound');
+
+$retainedHash = str_repeat('b', 64);
+$newHash = str_repeat('c', 64);
+$seedLines = [];
+for ($index = 0; $index < 2200; ++$index) {
+    $seedLines[] = json_encode([
+        'timestamp' => '2026-07-30T00:00:00+00:00',
+        'outcome' => 'failure',
+        'message_id_hash' => hash('sha256', 'seed-' . $index),
+        'classification' => 'http_error',
+        'http_status' => 500,
+    ], JSON_THROW_ON_ERROR);
+}
+$seedLines[] = json_encode([
+    'timestamp' => '2026-07-30T00:00:01+00:00',
+    'outcome' => 'failure',
+    'message_id_hash' => $retainedHash,
+    'classification' => 'http_error',
+    'http_status' => 500,
+], JSON_THROW_ON_ERROR);
+$oversizedSeed = implode("\n", $seedLines) . "\nnot-json\n[]\n42\n{\"partial\":";
+deliveryCheck(strlen($oversizedSeed) > $boundedMaximum,
+    'Compaction fixture must begin above the server log bound');
+$compactionPath = $logDirectory . '/bounded-compaction.jsonl';
+file_put_contents($compactionPath, $oversizedSeed);
+chmod($compactionPath, 0600);
+$beforeCompaction = lstat($compactionPath);
+(new OperationalLogger($compactionPath, $fixedLogClock))->log(
+    'success', $newHash, 'success', 200,
+);
+$afterCompaction = lstat($compactionPath);
+$compactedBytes = (string) file_get_contents($compactionPath);
+deliveryCheck(strlen($compactedBytes) <= $boundedMaximum && str_ends_with($compactedBytes, "\n"),
+    'Compacted operational log must be bounded and newline terminated');
+deliveryCheck(str_contains($compactedBytes, $retainedHash) && str_contains($compactedBytes, $newHash),
+    'Compaction must retain the latest existing valid event and the new event');
+deliveryCheck(!str_contains($compactedBytes, 'not-json') && !str_contains($compactedBytes, 'partial'),
+    'Compaction must discard malformed and partial tail records');
+foreach (array_filter(explode("\n", $compactedBytes)) as $compactedLine) {
+    deliveryCheck(json_decode($compactedLine, false, 16, JSON_THROW_ON_ERROR) instanceof stdClass,
+        'Compaction must retain only complete UTF-8 JSON object lines');
+}
+deliveryCheck(is_array($beforeCompaction) && is_array($afterCompaction)
+    && $beforeCompaction['dev'] === $afterCompaction['dev']
+    && $beforeCompaction['ino'] === $afterCompaction['ino']
+    && ($afterCompaction['mode'] & 0777) === 0600
+    && $afterCompaction['uid'] === posix_geteuid() && $afterCompaction['nlink'] === 1,
+    'Compaction must preserve inode, owner-only mode, effective owner, and one-link identity');
+
+$oversizedEventPath = $logDirectory . '/oversized-event.jsonl';
+file_put_contents($oversizedEventPath, "UNCHANGED_OVERSIZED_EVENT\n");
+chmod($oversizedEventPath, 0600);
+$largeAttempt = new WebhookAttemptDiagnostic(
+    500, 'E500', 'server error', 'json', 'application/json', 2, $validBodyHash,
+);
+try {
+    (new OperationalLogger($oversizedEventPath, $fixedLogClock))->log(
+        'failure', str_repeat('d', 64), 'http_error', 500,
+        new WebhookDiagnostic(array_fill(0, 31_000, $largeAttempt), 10, 3, 4, false),
+    );
+    throw new RuntimeException('Oversized operational event was accepted');
+} catch (RuntimeException $exception) {
+    deliveryCheck($exception->getMessage() !== 'Oversized operational event was accepted',
+        'A single event above 120 KiB must be rejected before mutation');
+}
+deliveryCheck((string) file_get_contents($oversizedEventPath) === "UNCHANGED_OVERSIZED_EVENT\n",
+    'Rejected oversized event must leave the existing log unchanged');
+
+$faultPath = $logDirectory . '/bounded-fault.jsonl';
+file_put_contents($faultPath, $oversizedSeed);
+chmod($faultPath, 0600);
+$beforeFault = lstat($faultPath);
+try {
+    (new OperationalLogger(
+        $faultPath,
+        $fixedLogClock,
+        null,
+        static fn (): never => throw new RuntimeException('Injected before truncate'),
+    ))->log('success', str_repeat('e', 64), 'success', 200);
+    throw new RuntimeException('Compaction fault was not propagated');
+} catch (RuntimeException $exception) {
+    deliveryCheck($exception->getMessage() !== 'Compaction fault was not propagated',
+        'Injected compaction failure must become a fixed logging failure');
+}
+$afterFault = lstat($faultPath);
+$faultBytes = (string) file_get_contents($faultPath);
+deliveryCheck(is_array($beforeFault) && is_array($afterFault)
+    && $beforeFault['size'] === $afterFault['size']
+    && $beforeFault['ino'] === $afterFault['ino']
+    && str_contains($faultBytes, $retainedHash),
+    'Failure before truncate must preserve the old length, inode, and latest valid tail event');
+
 $wrongOwnerPath = $logDirectory . '/wrong-owner.jsonl';
 file_put_contents($wrongOwnerPath, "UNCHANGED_WRONG_OWNER\n");
 chmod($wrongOwnerPath, 0600);
@@ -616,7 +869,13 @@ try {
 deliveryCheck(!file_exists($publicLogPath), 'Rejected public path must not receive a log file');
 
 unlink($logPath);
+unlink($echoLogPath);
 unlink($loggerBoundaryPath);
+unlink($templateLogPath);
+unlink($exactBoundaryPath);
+unlink($compactionPath);
+unlink($oversizedEventPath);
+unlink($faultPath);
 unlink($wrongOwnerPath);
 unlink($badModePath);
 unlink($symlinkPath);

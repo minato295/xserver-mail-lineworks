@@ -44,7 +44,7 @@ LINE WORKS Incoming WebhookがHTTP 500などを返した際に、メール本文
 
 診断項目はWebhookの最終結果と、同一送信処理内の試行履歴を表す。再試行で成功した場合も初回エラーの状態・コード・説明を保持し、一時障害だったことを判定可能にする。
 
-`provider_code`と`provider_description`は信頼済みのローカル値ではなく、外部LINE WORKS応答本文から抽出した非信頼入力である。`WebhookClient`と`OperationalLogger`の両境界で型、制御文字、長さ、応答形式との相関を検証する。既知の固定provider説明以外で、送信payload内の8文字以上の連続断片を直接echoする説明は保存せず`null`とする。
+`provider_code`と`provider_description`は信頼済みのローカル値ではなく、外部LINE WORKS応答本文から抽出した非信頼入力である。`WebhookClient`と`OperationalLogger`の両境界で型、制御文字、長さ、応答形式との相関を検証する。送信payload内の8文字以上の連続断片を直接echoする説明は例外なく保存せず`null`とする。残るprovider説明も外部入力として扱い、Mac consumerはC0・DEL・C1をfail-closedで拒否し、表示時にもURL、メールアドレス、hash、制御文字を再検査する。これらの多層防御によってメール内容を保存しない契約を維持する。
 
 ## 保存禁止情報
 

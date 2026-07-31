@@ -1207,7 +1207,7 @@ class MailManager:
                     and re.search(r"[\x00-\x1f\x7f-\x9f]", code) is None))
                 or not (description is None or (
                     type(description) is str and len(description) <= 200
-                    and re.search(r"[\x7f-\x9f]", description) is None))
+                    and re.search(r"[\x00-\x1f\x7f-\x9f]", description) is None))
                 or response_format not in {
                     "json", "invalid_json", "transport_error"
                 }

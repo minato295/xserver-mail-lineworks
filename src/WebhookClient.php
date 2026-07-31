@@ -171,28 +171,20 @@ final class WebhookClient
     {
         $response = $this->request($payload);
         $attempts = [$response['attempt']];
-        $retried = false;
-        if ($response['result']->httpStatus !== null
-            && $response['result']->httpStatus >= 500
-            && $response['result']->httpStatus <= 599) {
-            ($this->sleeper)(5);
-            $response = $this->request($payload);
-            $attempts[] = $response['attempt'];
-            $retried = true;
+        $status = $response['result']->httpStatus;
+        $delay = null;
+        if ($status !== null && $status >= 500 && $status <= 599) {
+            $delay = 5;
+        } elseif ($status === 429) {
+            $reset = filter_var($response['headers']['ratelimit-reset'] ?? null, FILTER_VALIDATE_INT);
+            if ($reset !== false && $reset >= 0 && $reset <= 15) {
+                $delay = $reset;
+            }
         }
-        if ($response['result']->httpStatus !== 429) {
-            return [
-                'result' => $response['result'],
-                'attempts' => $attempts,
-                'recoveredByRetry' => $retried && $response['result']->isSuccess(),
-            ];
-        }
-
-        $reset = filter_var($response['headers']['ratelimit-reset'] ?? null, FILTER_VALIDATE_INT);
-        if ($reset === false || $reset < 0 || $reset > 15) {
+        if ($delay === null) {
             return ['result' => $response['result'], 'attempts' => $attempts, 'recoveredByRetry' => false];
         }
-        ($this->sleeper)($reset);
+        ($this->sleeper)($delay);
 
         $retry = $this->request($payload);
         $attempts[] = $retry['attempt'];
@@ -243,12 +235,17 @@ final class WebhookClient
                 'too many request' => 'rate_limited',
                 default => 'http_error',
             };
+            $diagnosticDescription = $description;
+            if ($description !== '' && $this->isPayloadEcho($description, $payload)) {
+                $diagnosticDescription = '';
+            }
 
             return [
                 'result' => new WebhookResult($success, $status, $classification),
                 'headers' => $headers,
                 'attempt' => new WebhookAttemptDiagnostic(
-                    $status, $code, $description === '' ? null : $description, 'json', $contentType, $bodyBytes, $bodyHash,
+                    $status, $code, $diagnosticDescription === '' ? null : $diagnosticDescription,
+                    'json', $contentType, $bodyBytes, $bodyHash,
                 ),
             ];
         } catch (Throwable) {
@@ -309,6 +306,22 @@ final class WebhookClient
     private function characterCount(string $value): int
     {
         return count(preg_split('//u', $value, -1, PREG_SPLIT_NO_EMPTY) ?: []);
+    }
+
+    private function isPayloadEcho(string $description, string $payload): bool
+    {
+        if ($this->characterCount($description) < 8) {
+            return false;
+        }
+        try {
+            $decoded = json_decode($payload, true, 8, JSON_THROW_ON_ERROR);
+        } catch (JsonException) {
+            return true;
+        }
+        $title = is_array($decoded) && is_string($decoded['title'] ?? null) ? $decoded['title'] : '';
+        $text = is_array($decoded) && is_array($decoded['body'] ?? null)
+            && is_string($decoded['body']['text'] ?? null) ? $decoded['body']['text'] : '';
+        return str_contains($title, $description) || str_contains($text, $description);
     }
 
     /** @return list<string> */

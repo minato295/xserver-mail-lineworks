@@ -302,24 +302,42 @@ class FtpsDeployer:
         """Bind one canonical absolute-path MLST entry to its requested file."""
         if not isinstance(response, str):
             raise RuntimeError("remote file mode could not be verified")
-        lines = [line.strip() for line in response.splitlines() if line.strip()]
-        if (len(lines) >= 3 and lines[0].startswith("250-Listing")
-                and lines[-1] == "250 End"):
+        lines = [line.rstrip("\r") for line in response.splitlines()]
+        if (len(lines) >= 3 and re.fullmatch(r"250-.*", lines[0]) is not None
+                and re.fullmatch(r"250 .*", lines[-1]) is not None):
             entry_lines = lines[1:-1]
-        elif len(lines) == 1 and lines[0].startswith("250 "):
+            if any(re.match(r"[0-9]{3}[- ]", line) for line in entry_lines):
+                raise RuntimeError("remote file mode could not be verified")
+        elif len(lines) == 1 and re.fullmatch(r"250 .+", lines[0]) is not None:
             entry_lines = [lines[0][4:]]
         else:
             raise RuntimeError("remote file mode could not be verified")
         entries = []
         for line in entry_lines:
-            if ";" not in line or " " not in line:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            fact_like = (
+                re.match(r"[A-Za-z0-9._-]+=", stripped) is not None
+                or re.match(
+                    r"(?i)(?:unix[.]mode|perm-mode|type)(?:\s|;)", stripped
+                ) is not None
+            )
+            if not fact_like:
+                continue
+            if " " not in stripped:
                 raise RuntimeError("remote file mode could not be verified")
-            fact_text, pathname = line.split(None, 1)
-            tokens = [token for token in fact_text.split(";") if token]
-            if not pathname or not tokens or any("=" not in token for token in tokens):
+            fact_text, pathname = stripped.split(None, 1)
+            if not fact_text.endswith(";") or not pathname:
+                raise RuntimeError("remote file mode could not be verified")
+            tokens = fact_text[:-1].split(";")
+            if not tokens:
                 raise RuntimeError("remote file mode could not be verified")
             facts = {}
             for token in tokens:
+                if (token.count("=") != 1
+                        or re.fullmatch(r"[A-Za-z0-9._-]+=[^;]+", token) is None):
+                    raise RuntimeError("remote file mode could not be verified")
                 name, value = token.split("=", 1)
                 name = name.casefold()
                 if name in facts:

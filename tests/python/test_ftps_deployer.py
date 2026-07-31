@@ -235,6 +235,38 @@ class FtpsDeployerTest(unittest.TestCase):
         self.assertNotIn(("retrieve", "RETR " + ftps_path), cases[0].calls)
         self.assertNotIn(("retrieve", "RETR " + ftps_path), cases[1].calls)
 
+    def test_private_log_tail_accepts_rfc_mlst_envelope_reply_text(self):
+        filesystem_path = "/home/example/mail-lineworks/private/log/mail-notifier.jsonl"
+        ftps_path = "/mail-lineworks/private/log/mail-notifier.jsonl"
+        responses = (
+            (
+                "250-File status follows\n"
+                " unix.mode=0600;type=file; %s\n"
+                "250 Requested file action okay" % ftps_path
+            ),
+            (
+                "250-MLST response for requested object\n"
+                " Server-generated informational text\n"
+                " Server time=now; informational only\n"
+                " Text; punctuation = accepted\n"
+                " unix.mode=0600;type=file; %s\n"
+                " Additional informational text\n"
+                "250 Transfer complete" % ftps_path
+            ),
+        )
+        for response in responses:
+            ftps = FakeFtps({ftps_path: b"safe\n"}, mlst_response=response)
+            deployer = FtpsDeployer(
+                "ftp.example.invalid", "user", "password",
+                config_remote_path="/mail-lineworks/private/config.json",
+                filesystem_home="/home/example", ftp_factory=lambda: ftps,
+            )
+            with self.subTest(response=response):
+                self.assertEqual(
+                    b"safe\n",
+                    deployer.read_private_log_tail(filesystem_path, limit=256 * 1024),
+                )
+
     def test_private_log_tail_rejects_mlst_with_any_second_entry_or_malformed_line(self):
         filesystem_path = "/home/example/mail-lineworks/private/log/mail-notifier.jsonl"
         ftps_path = "/mail-lineworks/private/log/mail-notifier.jsonl"
@@ -248,7 +280,7 @@ class FtpsDeployerTest(unittest.TestCase):
             (
                 "250-Listing\n"
                 " unix.mode=0600;type=file; %s\n"
-                " malformed second entry\n"
+                " unix.mode=0600;type=file malformed second entry\n"
                 "250 End" % ftps_path
             ),
             (

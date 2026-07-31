@@ -109,7 +109,7 @@ Webhook成功時はエラーメールを送りません。通常Webhookの失敗
 
 状態はprivateログと同じディレクトリのmode 600 `delivery-health.json` へ単調な観測sequenceとともに保存します。並行処理では新しい観測だけを反映するため、遅れて完了した古い失敗が復旧済み状態を戻すことはありません。sendmail成功直後かつ状態commit前にプロセスが停止した場合だけ、通知欠落を避けるため次回観測で同じ遷移メールが重複する可能性があります。この境界はat-least-onceです。
 
-429はサーバー指定時間を上限内で1回だけ再試行します。通信タイムアウトは重複防止のため再送・分割しません。明示的な400 invalid parameterかつローカルsoft cap超過の場合だけ段落単位に分割します。
+1つのpayloadは最大2回だけ送信します。初回429はサーバー指定時間が0〜15秒の場合、初回HTTP 5xxは5秒後に、それぞれ同一payloadを1回だけ再送します。2回目が429または5xxでも3回目は送信しません。通信タイムアウトは重複防止のため再送・分割しません。HTTP 5xx後の再送はat-least-onceであり、初回要求をLINE WORKS側が処理してから5xxを返した場合は通知が重複する可能性があります。明示的な400 invalid parameterかつローカルsoft cap超過の場合だけ段落単位に分割します。
 
 ## 障害対応
 
@@ -123,12 +123,14 @@ Webhook成功時はエラーメールを送りません。通常Webhookの失敗
 
 診断ログは公開領域外の `/home/s3710/mail-lineworks/private/log/mail-notifier.jsonl` にJSON Lines形式で保存します。ログファイルは所有者だけが読み書きできる `0600`、親ディレクトリは所有者だけがアクセスできる `0700` でなければなりません。サーバーは通常ファイル・所有者・権限を検証し、Mac管理CLIも認証済みFTPS接続でprivate領域とファイルの `0600` を確認してから読み取ります。権限、所有者、ファイル種別または保存場所が不正な場合、診断ログの書込み・表示は安全側に停止しますが、メール受信処理はfail-openを維持します。
 
+Macの読取り上限256 KiBに対し、サーバーは各追記前に容量をpreflightし、ログを240 KiB以下、単一イベントを120 KiB以下に保ちます。超過前には排他lock下で完全なUTF-8 JSON object行だけを末尾から保持し、直前の最新イベントと新イベントを残してcompactionします。inode、所有者、`0600`、`nlink=1`、親`0700`を再検証し、失敗時は配送を止めずログ更新だけを中止します。日中の配備前preflightでは、現行ログが256 KiB以下、ファイル`0600`、親`0700`であることを確認してください。
+
 ログへ保存するのは、既存の `timestamp`、`outcome`、`message_id_hash`、`classification`、`http_status` と、次の許可済み診断項目だけです。
 
 - `attempt_count`: Webhook送信回数
 - `attempt_http_statuses`: 各試行のHTTP状態（取得不能時は `null`）
 - `provider_code`: JSON応答のコード
-- `provider_description`: 制御文字を除去し長さを制限したJSON応答の説明
+- `provider_description`: 制御文字を除去し長さを制限した、外部provider由来の非信頼JSON応答説明
 - `response_format`: `json`、`invalid_json`、`transport_error` の区別
 - `response_content_type`: 長さを制限した応答Content-Type
 - `response_body_bytes`: 応答本文のバイト数
@@ -146,6 +148,8 @@ Webhook成功時はエラーメールを送りません。通常Webhookの失敗
 - Xserver APIキー、FTPS・SSH・メールの認証情報
 - LINE WORKS応答本文の原文
 - 例外メッセージ、HTTPリクエストヘッダー
+
+`provider_description`はLINE WORKS応答由来であり、信頼済みのローカル文言として扱いません。producerとloggerの両方で型・長さ・制御文字・応答形式との相関を検証し、送信した件名または本文の8文字以上の連続断片をproviderが直接echoした場合は説明を保存しません。Mac側も新規ログのC0・DEL・C1制御文字を拒否し、表示直前に再度除去・秘密値判定を行います。メール内容を保存しない契約はこの境界でも維持します。
 
 旧形式ログは引き続き読み取れますが、許可済み診断項目がない場合は「Webhook診断: 詳細診断情報なし」と表示します。ログが不正、過大、または安全な権限で読み取れない場合は「Webhook診断: 診断ログを安全に読み取れません」と表示します。
 
