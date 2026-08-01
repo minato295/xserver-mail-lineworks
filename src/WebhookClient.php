@@ -202,12 +202,12 @@ final class WebhookClient
     private function compatibilityText(string $value): string
     {
         $value = preg_replace_callback(
-            '/\b(https?):\/\//iu',
+            '/(https?):\/\//iu',
             static fn (array $matches): string => $matches[1] . "：//",
             $value,
         ) ?? $value;
         $value = preg_replace_callback(
-            '/\b(www)\./iu',
+            '/(www)\./iu',
             static fn (array $matches): string => $matches[1] . '．',
             $value,
         ) ?? $value;

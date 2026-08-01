@@ -539,7 +539,7 @@ $compatibilityClient = new WebhookClient(
     static function (): void {},
 );
 $compatibilityTitle = '送信者：件名';
-$compatibilityText = "本文 https://Example.INVALID/one と HTTP://www.example.invalid/two と WWW.example.invalid と ftp://files.example.invalid と bare.example.invalid\n<m userId=\"U123\">田中</m> と <m>開始だけ と 終了</m> と <address@example.invalid>\n既に全角：／＠＜＞";
+$compatibilityText = "本文 https://Example.INVALID/one と HTTP://www.example.invalid/two と WWW.example.invalid と ftp://files.example.invalid と bare.example.invalid と prefixhttps://adjacent.example.invalid と prefixwww.adjacent.example.invalid\n<m userId=\"U123\">田中</m> と <m>開始だけ と 終了</m> と <address@example.invalid>\n既に全角：／＠＜＞";
 $compatibilityResult = $compatibilityClient->sendWithCompatibility($compatibilityTitle, $compatibilityText);
 deliveryCheck($compatibilityResult->isSuccess(), 'Compatibility send must recover a canonical double 500');
 deliveryCheck(count($compatibilityPayloads) === 3 && $compatibilityPayloads[0] === $compatibilityPayloads[1],
@@ -547,14 +547,14 @@ deliveryCheck(count($compatibilityPayloads) === 3 && $compatibilityPayloads[0] =
 $compatibilityFallback = json_decode($compatibilityPayloads[2], true, 512, JSON_THROW_ON_ERROR);
 deliveryCheck($compatibilityFallback === [
     'title' => $compatibilityTitle,
-    'body' => ['text' => "本文 https：//Example.INVALID/one と HTTP：//www．example.invalid/two と WWW．example.invalid と ftp://files.example.invalid と bare.example.invalid\n＜m userId=\"U123\"＞田中＜/m＞ と ＜m＞開始だけ と 終了＜/m＞ と <address@example.invalid>\n既に全角：／＠＜＞"],
+    'body' => ['text' => "本文 https：//Example.INVALID/one と HTTP：//www．example.invalid/two と WWW．example.invalid と ftp://files.example.invalid と bare.example.invalid と prefixhttps：//adjacent.example.invalid と prefixwww．adjacent.example.invalid\n＜m userId=\"U123\"＞田中＜/m＞ と ＜m＞開始だけ と 終了＜/m＞ と <address@example.invalid>\n既に全角：／＠＜＞"],
 ], 'Compatibility recovery must only visibly neutralize URL and LINE WORKS mention syntax');
 deliveryCheck($compatibilityResult->diagnostic?->attemptHttpStatuses() === [500, 500, 200]
     && $compatibilityResult->diagnostic->recoveredByRetry,
     'Compatibility recovery diagnostics must retain all three attempts as one recovered request');
 deliveryCheck($compatibilityResult->diagnostic->payloadBytes === strlen($compatibilityPayloads[0])
     && $compatibilityResult->diagnostic->titleCharacters === 6
-    && $compatibilityResult->diagnostic->textCharacters === 219,
+    && $compatibilityResult->diagnostic->textCharacters === 297,
     'Compatibility recovery diagnostics must retain original payload dimensions');
 
 $ordinaryCompatibilityPayloads = [];
