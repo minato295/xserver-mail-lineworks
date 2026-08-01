@@ -96,7 +96,7 @@ final class DeliveryApplication
                 return;
             }
             $formatter = new NotificationFormatter();
-            $observed = $this->webhook->sendObserved(
+            $observed = $this->webhook->sendObservedWithCompatibility(
                 $formatter->title($message), $formatter->format($message),
             );
             $result = $observed->result;

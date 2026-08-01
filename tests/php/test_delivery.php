@@ -527,6 +527,116 @@ $smallInvalid = new WebhookClient(
 );
 deliveryCheck(!$smallInvalid->send('Title', 'short')->isSuccess() && $smallCalls === 1, 'Invalid parameter under soft cap must not split');
 
+$compatibilityPayloads = [];
+$compatibilityResponses = [response(500, 'server error'), response(500, 'server error'), response(200, 'success')];
+$compatibilityClient = new WebhookClient(
+    'https://webhook.worksmobile.com/message/test-placeholder',
+    static function (string $url, string $payload) use (&$compatibilityPayloads, &$compatibilityResponses): array {
+        $compatibilityPayloads[] = $payload;
+        return array_shift($compatibilityResponses);
+    },
+    256,
+    static function (): void {},
+);
+$compatibilityTitle = '送信者：件名';
+$compatibilityText = "本文 https://Example.INVALID/one と HTTP://www.example.invalid/two と WWW.example.invalid と ftp://files.example.invalid と bare.example.invalid\n<m userId=\"U123\">田中</m> と <m>開始だけ と 終了</m> と <address@example.invalid>\n既に全角：／＠＜＞";
+$compatibilityResult = $compatibilityClient->sendWithCompatibility($compatibilityTitle, $compatibilityText);
+deliveryCheck($compatibilityResult->isSuccess(), 'Compatibility send must recover a canonical double 500');
+deliveryCheck(count($compatibilityPayloads) === 3 && $compatibilityPayloads[0] === $compatibilityPayloads[1],
+    'Compatibility recovery must preserve the canonical payload for its two bounded retries');
+$compatibilityFallback = json_decode($compatibilityPayloads[2], true, 512, JSON_THROW_ON_ERROR);
+deliveryCheck($compatibilityFallback === [
+    'title' => $compatibilityTitle,
+    'body' => ['text' => "本文 https：//Example.INVALID/one と HTTP：//www．example.invalid/two と WWW．example.invalid と ftp://files.example.invalid と bare.example.invalid\n＜m userId=\"U123\"＞田中＜/m＞ と ＜m＞開始だけ と 終了＜/m＞ と <address@example.invalid>\n既に全角：／＠＜＞"],
+], 'Compatibility recovery must only visibly neutralize URL and LINE WORKS mention syntax');
+deliveryCheck($compatibilityResult->diagnostic?->attemptHttpStatuses() === [500, 500, 200]
+    && $compatibilityResult->diagnostic->recoveredByRetry,
+    'Compatibility recovery diagnostics must retain all three attempts as one recovered request');
+deliveryCheck($compatibilityResult->diagnostic->payloadBytes === strlen($compatibilityPayloads[0])
+    && $compatibilityResult->diagnostic->titleCharacters === 6
+    && $compatibilityResult->diagnostic->textCharacters === 219,
+    'Compatibility recovery diagnostics must retain original payload dimensions');
+
+$ordinaryCompatibilityPayloads = [];
+$ordinaryCompatibility = new WebhookClient(
+    'https://webhook.worksmobile.com/message/test-placeholder',
+    static function (string $url, string $payload) use (&$ordinaryCompatibilityPayloads): array {
+        $ordinaryCompatibilityPayloads[] = $payload;
+        return response(500, 'server error');
+    },
+    256,
+    static function (): void {},
+);
+$ordinaryCompatibility->send('Title', 'https://www.example.invalid <m userId="U1">田中</m>');
+deliveryCheck(count($ordinaryCompatibilityPayloads) === 2
+    && $ordinaryCompatibilityPayloads[0] === $ordinaryCompatibilityPayloads[1],
+    'Ordinary send must retain its original two-attempt payload behavior');
+
+foreach ([
+    ['canonical success', [response(200, 'success')]],
+    ['canonical 400', [response(400, 'invalid parameter')]],
+    ['canonical 429 recovery', [response(429, 'too many request', ['RateLimit-Reset' => '0']), response(200, 'success')]],
+    ['500 then 200', [response(500, 'server error'), response(200, 'success')]],
+    ['500 then 503', [response(500, 'server error'), response(503, 'server error')]],
+    ['503 then 500', [response(503, 'server error'), response(500, 'server error')]],
+    ['double 500 without syntax', [response(500, 'server error'), response(500, 'server error')]],
+] as [$compatibilityNoFallbackLabel, $compatibilityNoFallbackResponses]) {
+    $compatibilityNoFallbackExpectedCalls = count($compatibilityNoFallbackResponses);
+    $compatibilityNoFallbackPayloads = [];
+    $compatibilityNoFallback = new WebhookClient(
+        'https://webhook.worksmobile.com/message/test-placeholder',
+        static function (string $url, string $payload) use (&$compatibilityNoFallbackPayloads, &$compatibilityNoFallbackResponses): array {
+            $compatibilityNoFallbackPayloads[] = $payload;
+            return array_shift($compatibilityNoFallbackResponses);
+        },
+        256,
+        static function (): void {},
+    );
+    $compatibilityNoFallback->sendWithCompatibility('Title', 'ordinary text without transformable syntax');
+    deliveryCheck(count($compatibilityNoFallbackPayloads) === $compatibilityNoFallbackExpectedCalls,
+        $compatibilityNoFallbackLabel . ' must not add a compatibility request');
+}
+$compatibilityTransportCalls = 0;
+$compatibilityTransport = new WebhookClient(
+    'https://webhook.worksmobile.com/message/test-placeholder',
+    static function () use (&$compatibilityTransportCalls): array {
+        ++$compatibilityTransportCalls;
+        throw new RuntimeException('transport failure');
+    },
+    256,
+    static function (): void {},
+);
+$compatibilityTransport->sendWithCompatibility('Title', 'https://example.invalid');
+deliveryCheck($compatibilityTransportCalls === 1,
+    'Compatibility transport failures must not attempt a payload fallback');
+
+foreach ([
+    ['500', static fn (): array => response(500, 'server error'), 500, 'http_error'],
+    ['400', static fn (): array => response(400, 'invalid parameter'), 400, 'invalid_parameter'],
+    ['429', static fn (): array => response(429, 'too many request', ['RateLimit-Reset' => '0']), 429, 'rate_limited'],
+    ['invalid JSON', static fn (): array => ['status' => 502, 'body' => 'not-json', 'headers' => []], 502, 'http_error'],
+    ['transport', static function (): array { throw new RuntimeException('compatibility transport failure'); }, null, 'transport_error'],
+] as [$compatibilityFailureLabel, $compatibilityFailureResponse, $compatibilityFailureStatus, $compatibilityFailureClassification]) {
+    $compatibilityFailureCalls = 0;
+    $compatibilityFailure = new WebhookClient(
+        'https://webhook.worksmobile.com/message/test-placeholder',
+        static function () use (&$compatibilityFailureCalls, $compatibilityFailureResponse): array {
+            ++$compatibilityFailureCalls;
+            return $compatibilityFailureCalls <= 2
+                ? response(500, 'server error')
+                : $compatibilityFailureResponse();
+        },
+        256,
+        static function (): void {},
+    );
+    $compatibilityFailureResult = $compatibilityFailure->sendWithCompatibility('Title', 'https://example.invalid');
+    deliveryCheck(!$compatibilityFailureResult->isSuccess()
+        && $compatibilityFailureCalls === 3
+        && $compatibilityFailureResult->httpStatus === $compatibilityFailureStatus
+        && $compatibilityFailureResult->classification === $compatibilityFailureClassification,
+        'Compatibility ' . $compatibilityFailureLabel . ' failure must stop after its one direct request');
+}
+
 $timeoutCalls = 0;
 $timeout = new WebhookClient(
     'https://webhook.worksmobile.com/message/test-placeholder',
@@ -542,6 +652,23 @@ $logDirectory = realpath($logDirectory);
 deliveryCheck(is_string($logDirectory), 'Operational log fixture directory must resolve');
 $logPath = $logDirectory . '/operational.jsonl';
 $logger = new OperationalLogger($logPath);
+$compatibilityRecoveryLogPath = $logDirectory . '/compatibility-recovery.jsonl';
+(new OperationalLogger($compatibilityRecoveryLogPath))->log(
+    'success', str_repeat('7', 64), $compatibilityResult->classification,
+    $compatibilityResult->httpStatus, $compatibilityResult->diagnostic,
+);
+$compatibilityRecoveryEvent = json_decode(
+    (string) file_get_contents($compatibilityRecoveryLogPath), true, 512, JSON_THROW_ON_ERROR,
+);
+deliveryCheck(array_keys($compatibilityRecoveryEvent) === [
+    'timestamp', 'outcome', 'message_id_hash', 'classification', 'http_status',
+    'attempt_count', 'attempt_http_statuses', 'provider_code', 'provider_description',
+    'response_format', 'response_content_type', 'response_body_bytes', 'response_body_sha256',
+    'payload_bytes', 'title_characters', 'text_characters', 'recovered_by_retry',
+] && $compatibilityRecoveryEvent['attempt_http_statuses'] === [500, 500, 200]
+    && $compatibilityRecoveryEvent['recovered_by_retry'] === true
+    && !str_contains((string) file_get_contents($compatibilityRecoveryLogPath), 'Example.INVALID'),
+    'Operational logging must accept three-attempt compatibility recovery without payload content');
 $echoLogPath = $logDirectory . '/provider-echo.jsonl';
 (new OperationalLogger($echoLogPath))->log(
     'failure', str_repeat('9', 64), $echoResult->classification,
@@ -1228,6 +1355,7 @@ unlink($shortWritePath);
 unlink($flushFaultPath);
 unlink($afterRenameFaultPath);
 unlink($restartPath);
+unlink($compatibilityRecoveryLogPath);
 if (isset($parallelPath) && file_exists($parallelPath)) {
     unlink($parallelPath);
 }
@@ -1664,6 +1792,63 @@ $retryRaw = str_replace('<same@example.invalid>', '<retry@example.invalid>', $sa
 $retryApplication->deliver($retryRaw);
 $retryApplication->deliver($retryRaw);
 deliveryCheck($retryCalls === 2, 'Final webhook failure must remain claimed after its one in-process retry');
+
+$compatibilityDeliveryDirectory = sys_get_temp_dir() . '/compatibility-delivery-' . bin2hex(random_bytes(8));
+mkdir($compatibilityDeliveryDirectory, 0700);
+$compatibilityDeliveryLog = $compatibilityDeliveryDirectory . '/delivery.log';
+$compatibilityDeliveryPrimaryPayloads = [];
+$compatibilityDeliveryPrimaryResponses = [
+    response(500, 'server error'), response(500, 'server error'), response(400, 'invalid parameter'),
+];
+$compatibilityDeliveryPrimary = new WebhookClient(
+    'https://webhook.worksmobile.com/message/test',
+    static function (string $url, string $payload) use (
+        &$compatibilityDeliveryPrimaryPayloads, &$compatibilityDeliveryPrimaryResponses,
+    ): array {
+        $compatibilityDeliveryPrimaryPayloads[] = $payload;
+        return array_shift($compatibilityDeliveryPrimaryResponses);
+    },
+    32_768,
+    static function (): void {},
+);
+$compatibilityDeliveryAlertCalls = 0;
+$compatibilityDeliveryAlert = new WebhookClient(
+    'https://webhook.worksmobile.com/message/error-test',
+    static function () use (&$compatibilityDeliveryAlertCalls): array {
+        ++$compatibilityDeliveryAlertCalls;
+        return response(500, 'server error');
+    },
+    32_768,
+    static function (): void {},
+);
+$compatibilityDeliveryLogger = new OperationalLogger($compatibilityDeliveryLog);
+$compatibilityDeliveryApplication = new DeliveryApplication(
+    $compatibilityDeliveryPrimary,
+    new ErrorReporter($compatibilityDeliveryAlert, $compatibilityDeliveryLogger),
+    $compatibilityDeliveryLogger,
+    null,
+    new DeliveryDeduplicator($compatibilityDeliveryDirectory . '/claims.json'),
+);
+$compatibilityDeliveryRaw = "From: sender@example.invalid\r\nTo: target@example.invalid\r\n"
+    . "Message-ID: <compatibility-delivery@example.invalid>\r\n\r\nhttps://www.example.invalid/path\n<m userId=\"U1\">田中</m>";
+$compatibilityDeliveryApplication->deliver($compatibilityDeliveryRaw);
+$compatibilityDeliveryApplication->deliver($compatibilityDeliveryRaw);
+deliveryCheck(count($compatibilityDeliveryPrimaryPayloads) === 3
+    && $compatibilityDeliveryPrimaryPayloads[0] === $compatibilityDeliveryPrimaryPayloads[1]
+    && $compatibilityDeliveryAlertCalls === 2,
+    'Primary delivery alone must use one compatibility request while its error alert retains two attempts');
+$compatibilityDeliveryFallback = json_decode($compatibilityDeliveryPrimaryPayloads[2], true, 512, JSON_THROW_ON_ERROR);
+deliveryCheck(
+    str_contains($compatibilityDeliveryFallback['body']['text'], 'https：//www．example.invalid/path'),
+    'DeliveryApplication must select the compatibility API for the primary inbound notification',
+);
+$compatibilityDeliveryLogs = (string) file_get_contents($compatibilityDeliveryLog);
+deliveryCheck(str_contains($compatibilityDeliveryLogs, '"attempt_http_statuses":[500,500,400]')
+    && !str_contains($compatibilityDeliveryLogs, 'https://www.example.invalid/path'),
+    'Three-attempt compatibility diagnostics must use the existing schema without payload content');
+foreach (glob($compatibilityDeliveryDirectory . '/*') ?: [] as $file) { if (is_file($file)) unlink($file); }
+foreach (glob($compatibilityDeliveryDirectory . '/.*') ?: [] as $file) { if (is_file($file)) unlink($file); }
+rmdir($compatibilityDeliveryDirectory);
 
 $throwingReporter = new ErrorReporter(
     new WebhookClient('https://webhook.worksmobile.com/message/test', static fn (): array => response(500, 'server error')),
