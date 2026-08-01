@@ -92,6 +92,21 @@ final class WebhookClient
 
     public function sendObserved(string $title, string $text): ObservedWebhookResult
     {
+        return $this->sendObservedInternal($title, $text, false);
+    }
+
+    public function sendWithCompatibility(string $title, string $text): WebhookResult
+    {
+        return $this->sendObservedWithCompatibility($title, $text)->result;
+    }
+
+    public function sendObservedWithCompatibility(string $title, string $text): ObservedWebhookResult
+    {
+        return $this->sendObservedInternal($title, $text, true);
+    }
+
+    private function sendObservedInternal(string $title, string $text, bool $allowCompatibility): ObservedWebhookResult
+    {
         try {
             $payload = $this->payload($title, $text);
         } catch (JsonException) {
@@ -103,6 +118,22 @@ final class WebhookClient
 
         $sequence = $this->healthMonitor?->reserveObservation();
         $request = $this->requestWithRateLimitRetry($payload, $title, $text);
+        if ($allowCompatibility && $this->shouldUseCompatibility($request)) {
+            [$compatibilityTitle, $compatibilityText] = $this->compatibilityValues($title, $text);
+            $compatibilityPayload = $this->payload($compatibilityTitle, $compatibilityText);
+            if ($compatibilityPayload !== $payload) {
+                $compatibility = $this->request($compatibilityPayload, $compatibilityTitle, $compatibilityText);
+                $request = [
+                    'result' => $compatibility['result'],
+                    'attempts' => [...$request['attempts'], $compatibility['attempt']],
+                    'recoveredByRetry' => $compatibility['result']->isSuccess(),
+                ];
+                return new ObservedWebhookResult(
+                    $this->withDiagnostic($request, $payload, $title, $text),
+                    $sequence,
+                );
+            }
+        }
         $result = $this->withDiagnostic($request, $payload, $title, $text);
         if ($result->isSuccess()) {
             return new ObservedWebhookResult($result, $sequence);
@@ -151,6 +182,42 @@ final class WebhookClient
             ),
             $sequence,
         );
+    }
+
+    /** @param array{result:WebhookResult,attempts:list<WebhookAttemptDiagnostic>,recoveredByRetry:bool} $request */
+    private function shouldUseCompatibility(array $request): bool
+    {
+        return array_map(
+            static fn (WebhookAttemptDiagnostic $attempt): ?int => $attempt->httpStatus,
+            $request['attempts'],
+        ) === [500, 500];
+    }
+
+    /** @return array{string,string} */
+    private function compatibilityValues(string $title, string $text): array
+    {
+        return [$this->compatibilityText($title), $this->compatibilityText($text)];
+    }
+
+    private function compatibilityText(string $value): string
+    {
+        $value = preg_replace_callback(
+            '/(https?):\/\//iu',
+            static fn (array $matches): string => $matches[1] . "：//",
+            $value,
+        ) ?? $value;
+        $value = preg_replace_callback(
+            '/(www)\./iu',
+            static fn (array $matches): string => $matches[1] . '．',
+            $value,
+        ) ?? $value;
+        $value = preg_replace_callback(
+            '/<m(?=[\s>])[^>]*>/u',
+            static fn (array $matches): string => '＜' . substr($matches[0], 1, -1) . '＞',
+            $value,
+        ) ?? $value;
+
+        return str_replace('</m>', '＜/m＞', $value);
     }
 
     private function payload(string $title, string $text): string
