@@ -1993,6 +1993,59 @@ class ManagerTest(unittest.TestCase):
             manager._latest_webhook_diagnostic(config)["webhook_diagnostic"],
         )
 
+    def test_diagnostics_accept_legacy_system_mail_suppression_as_non_diagnostic(self):
+        log_path = "/home/example/mail-lineworks/private/log/mail-notifier.jsonl"
+        suppression = {
+            "timestamp": "2026-07-29T23:10:49+00:00",
+            "outcome": "success",
+            "message_id_hash": "3" * 64,
+            "classification": "system_mail_suppressed",
+            "http_status": None,
+        }
+        config = {
+            "notification_targets": [], "notification_pinned_targets": [],
+            "command_path": "/private/mail-forward-command", "log_path": log_path,
+        }
+        only_suppression, _, _, _ = self.make_manager(
+            config=config,
+            log_body=(json.dumps(suppression, separators=(",", ":")) + "\n").encode(),
+        )
+        self.assertEqual(
+            "詳細診断情報なし",
+            only_suppression._latest_webhook_diagnostic(config)["webhook_diagnostic"],
+        )
+
+        detailed = webhook_diagnostic_event()
+        with_suppression, _, _, _ = self.make_manager(
+            config=config,
+            log_body=(
+                json.dumps(detailed, separators=(",", ":")) + "\n"
+                + json.dumps(suppression, separators=(",", ":")) + "\n"
+            ).encode(),
+        )
+        rendered = with_suppression._latest_webhook_diagnostic(config)["webhook_diagnostic"]
+        self.assertIn("ID 111111111111", rendered)
+        self.assertNotEqual("診断ログを安全に読み取れません", rendered)
+
+    def test_diagnostics_reject_detailed_system_mail_suppression(self):
+        log_path = "/home/example/mail-lineworks/private/log/mail-notifier.jsonl"
+        event = webhook_diagnostic_event(
+            outcome="success", classification="system_mail_suppressed", http_status=200,
+            attempt_http_statuses=[200], provider_code=200, provider_description="success",
+        )
+        config = {
+            "notification_targets": [], "notification_pinned_targets": [],
+            "command_path": "/private/mail-forward-command", "log_path": log_path,
+        }
+        manager, _, _, _ = self.make_manager(
+            config=config,
+            log_body=(json.dumps(event, separators=(",", ":")) + "\n").encode(),
+        )
+        self.assertEqual(
+            "診断ログを安全に読み取れません",
+            manager._latest_webhook_diagnostic(config)["webhook_diagnostic"],
+        )
+
     def test_diagnostics_hide_sensitive_provider_values_in_valid_events(self):
         log_path = "/home/example/mail-lineworks/private/log/mail-notifier.jsonl"
         cases = (

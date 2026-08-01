@@ -14,10 +14,11 @@ from manager.keychain import Keychain
 
 class FakeFtps:
     def __init__(self, files=None, mlst_response=None, modes=None,
-                 retr_error=None, mlst_error=None):
+                 mlst_responses=None, retr_error=None, mlst_error=None):
         self.calls = []
         self.files = dict(files or {})
         self.mlst_response = mlst_response
+        self.mlst_responses = dict(mlst_responses or {})
         self.modes = dict(modes or {})
         self.retr_error = retr_error
         self.mlst_error = mlst_error
@@ -46,9 +47,14 @@ class FakeFtps:
                 raise self.mlst_error
             path = command.removeprefix("MLST ")
             if path in self.modes:
-                return "250-Listing\n unix.mode=0%s;type=file; %s\n250 End" % (
-                    self.modes[path], path
+                entry_type, mode = self.modes[path] if isinstance(
+                    self.modes[path], tuple
+                ) else ("file", self.modes[path])
+                return "250-Listing\n unix.mode=0%s;type=%s; %s\n250 End" % (
+                    mode, entry_type, path
                 )
+            if path in self.mlst_responses:
+                return self.mlst_responses[path]
             return self.mlst_response
     def rename(self, source, target):
         self.calls.append(("rename", source, target))
@@ -190,8 +196,11 @@ class FtpsDeployerTest(unittest.TestCase):
     def test_private_log_tail_verifies_owner_only_mode_before_bounded_read(self):
         filesystem_path = "/home/example/mail-lineworks/private/log/mail-notifier.jsonl"
         ftps_path = "/mail-lineworks/private/log/mail-notifier.jsonl"
+        parent_path = "/mail-lineworks/private/log"
         body = b'{"outcome":"failure"}\n'
-        ftps = FakeFtps({ftps_path: body}, modes={ftps_path: "600"})
+        ftps = FakeFtps(
+            {ftps_path: body}, modes={parent_path: ("dir", "700"), ftps_path: "600"}
+        )
         deployer = FtpsDeployer(
             "ftp.example.invalid", "user", "password",
             config_remote_path="/mail-lineworks/private/config.json",
@@ -205,10 +214,45 @@ class FtpsDeployerTest(unittest.TestCase):
         self.assertEqual(1, sum(call[0] == "connect" for call in ftps.calls))
         self.assertEqual(1, sum(call[0] == "login" for call in ftps.calls))
         self.assertEqual(1, sum(call[0] == "prot_p" for call in ftps.calls))
-        self.assertLess(
-            ftps.calls.index(("sendcmd", "MLST " + ftps_path)),
-            ftps.calls.index(("retrieve", "RETR " + ftps_path)),
+        self.assertEqual(
+            [
+                ("sendcmd", "MLST " + parent_path),
+                ("sendcmd", "MLST " + ftps_path),
+                ("retrieve", "RETR " + ftps_path),
+            ],
+            [call for call in ftps.calls if call[0] in {"sendcmd", "retrieve"}],
         )
+
+    def test_private_log_tail_rejects_unsafe_or_malformed_parent_before_file_read(self):
+        filesystem_path = "/home/example/mail-lineworks/private/log/mail-notifier.jsonl"
+        ftps_path = "/mail-lineworks/private/log/mail-notifier.jsonl"
+        parent_path = "/mail-lineworks/private/log"
+        malformed = "250 malformed MLST response"
+        cases = (
+            FakeFtps(
+                {ftps_path: b"safe\n"},
+                modes={parent_path: ("dir", "755"), ftps_path: "600"},
+            ),
+            FakeFtps(
+                {ftps_path: b"safe\n"},
+                modes={parent_path: ("file", "700"), ftps_path: "600"},
+            ),
+            FakeFtps(
+                {ftps_path: b"safe\n"}, modes={ftps_path: "600"},
+                mlst_responses={parent_path: malformed},
+            ),
+        )
+        for ftps in cases:
+            deployer = FtpsDeployer(
+                "ftp.example.invalid", "user", "password",
+                config_remote_path="/mail-lineworks/private/config.json",
+                filesystem_home="/home/example", ftp_factory=lambda: ftps,
+            )
+            with self.subTest(calls=ftps.calls), self.assertRaisesRegex(
+                    RuntimeError, "^remote private log could not be read$"):
+                deployer.read_private_log_tail(filesystem_path, limit=256 * 1024)
+            self.assertNotIn(("sendcmd", "MLST " + ftps_path), ftps.calls)
+            self.assertNotIn(("retrieve", "RETR " + ftps_path), ftps.calls)
 
     def test_private_log_tail_rejects_unsafe_mode_ambiguous_mlst_and_oversize(self):
         filesystem_path = "/home/example/mail-lineworks/private/log/mail-notifier.jsonl"
@@ -220,9 +264,15 @@ class FtpsDeployerTest(unittest.TestCase):
             "250 End" % (ftps_path, ftps_path)
         )
         cases = (
-            FakeFtps({ftps_path: b"safe\n"}, modes={ftps_path: "644"}),
-            FakeFtps({ftps_path: b"safe\n"}, mlst_response=ambiguous),
-            FakeFtps({ftps_path: b"x" * (256 * 1024 + 1)}, modes={ftps_path: "600"}),
+            FakeFtps({ftps_path: b"safe\n"}, modes={
+                "/mail-lineworks/private/log": ("dir", "700"), ftps_path: "644",
+            }),
+            FakeFtps({ftps_path: b"safe\n"}, modes={
+                "/mail-lineworks/private/log": ("dir", "700"),
+            }, mlst_response=ambiguous),
+            FakeFtps({ftps_path: b"x" * (256 * 1024 + 1)}, modes={
+                "/mail-lineworks/private/log": ("dir", "700"), ftps_path: "600",
+            }),
         )
         for ftps in cases:
             with self.subTest(calls=ftps.calls), self.assertRaises(RuntimeError):
@@ -255,7 +305,9 @@ class FtpsDeployerTest(unittest.TestCase):
             ),
         )
         for response in responses:
-            ftps = FakeFtps({ftps_path: b"safe\n"}, mlst_response=response)
+            ftps = FakeFtps({ftps_path: b"safe\n"}, modes={
+                "/mail-lineworks/private/log": ("dir", "700"),
+            }, mlst_response=response)
             deployer = FtpsDeployer(
                 "ftp.example.invalid", "user", "password",
                 config_remote_path="/mail-lineworks/private/config.json",
@@ -291,7 +343,9 @@ class FtpsDeployerTest(unittest.TestCase):
             ),
         )
         for response in responses:
-            ftps = FakeFtps({ftps_path: b"safe\n"}, mlst_response=response)
+            ftps = FakeFtps({ftps_path: b"safe\n"}, modes={
+                "/mail-lineworks/private/log": ("dir", "700"),
+            }, mlst_response=response)
             deployer = FtpsDeployer(
                 "ftp.example.invalid", "user", "password",
                 config_remote_path="/mail-lineworks/private/config.json",

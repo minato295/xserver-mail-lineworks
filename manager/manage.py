@@ -1163,8 +1163,9 @@ class MailManager:
                     and (type(status) is not int or not 100 <= status <= 599))
                 or type(event["message_id_hash"]) is not str
                 or re.fullmatch(r"[a-f0-9]{64}", event["message_id_hash"]) is None
-                or (outcome == "success" and (
-                    classification not in {"success", "internal_error"} or status != 200))
+                or (outcome == "success" and not (
+                    classification in {"success", "internal_error"} and status == 200
+                    or classification == "system_mail_suppressed" and status is None))
                 or (outcome == "ignored"
                     and (classification != "non_target_recipient" or status is not None))
                 or (outcome == "failure"
@@ -1184,6 +1185,9 @@ class MailManager:
             "title_characters", "text_characters", "recovered_by_retry",
         }
         if not isinstance(event, dict) or set(event) not in (legacy_keys, diagnostic_keys):
+            raise ValueError("invalid webhook diagnostic")
+        if (set(event) == diagnostic_keys
+                and event["classification"] == "system_mail_suppressed"):
             raise ValueError("invalid webhook diagnostic")
         occurred_at = cls._validated_webhook_log_common(event)
         if set(event) == legacy_keys:

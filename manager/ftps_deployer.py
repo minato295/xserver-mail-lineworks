@@ -251,6 +251,7 @@ class FtpsDeployer:
         if not relative_path.parts:
             raise ValueError("private log path is invalid")
         ftp_path = (PurePosixPath("/mail-lineworks/private") / relative_path).as_posix()
+        parent_path = PurePosixPath(ftp_path).parent.as_posix()
         self._validate_private(ftp_path)
 
         body = bytearray()
@@ -263,6 +264,9 @@ class FtpsDeployer:
         ftp = self._connect()
         try:
             try:
+                self._verify_mlst_mode(
+                    ftp.sendcmd("MLST " + parent_path), parent_path, "700", expected_type="dir"
+                )
                 self._verify_mlst_mode(
                     ftp.sendcmd("MLST " + ftp_path), ftp_path, expected_mode
                 )
@@ -298,8 +302,8 @@ class FtpsDeployer:
             raise RuntimeError("remote file mode could not be verified")
 
     @staticmethod
-    def _verify_mlst_mode(response, remote_path, expected_mode):
-        """Bind one canonical absolute-path MLST entry to its requested file."""
+    def _verify_mlst_mode(response, remote_path, expected_mode, *, expected_type="file"):
+        """Bind one canonical absolute-path MLST entry to its requested object."""
         if not isinstance(response, str):
             raise RuntimeError("remote file mode could not be verified")
         lines = [line.rstrip("\r") for line in response.splitlines()]
@@ -347,7 +351,7 @@ class FtpsDeployer:
         if len(entries) != 1:
             raise RuntimeError("remote file mode could not be verified")
         pathname, facts = entries[0]
-        if pathname != remote_path or facts.get("type", "").casefold() != "file":
+        if pathname != remote_path or facts.get("type", "").casefold() != expected_type:
             raise RuntimeError("remote file mode could not be verified")
         mode_values = [facts[name] for name in ("unix.mode", "perm-mode") if name in facts]
         if mode_values != ["0" + expected_mode]:
