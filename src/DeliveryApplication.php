@@ -84,7 +84,7 @@ final class DeliveryApplication
                 }
             }
             if ($this->isForcedErrorTest($message)) {
-                $this->releaseReservation($messageIdHash, $reservation);
+                $this->commitReservation($messageIdHash, $reservation);
                 $sequence = $this->healthMonitor?->reserveSyntheticFailure();
                 if ($sequence !== null) {
                     $this->healthMonitor?->recordFailure(
@@ -104,10 +104,8 @@ final class DeliveryApplication
                 if ($observed->sequence !== null) {
                     $this->healthMonitor?->recordSuccess($observed->sequence);
                 }
-                $this->commitReservation($messageIdHash, $reservation);
-            } else {
-                $this->releaseReservation($messageIdHash, $reservation);
             }
+            $this->commitReservation($messageIdHash, $reservation);
             $this->logger->log(
                 $result->isSuccess() ? 'success' : 'failure',
                 $messageIdHash,
@@ -116,7 +114,7 @@ final class DeliveryApplication
                 $result->diagnostic,
             );
         } catch (Throwable $error) {
-            $this->releaseReservation($messageIdHash, $reservation);
+            $this->commitReservation($messageIdHash, $reservation);
             $this->safeReport($error, $messageIdHash);
             return;
         }
@@ -149,23 +147,19 @@ final class DeliveryApplication
 
     private function commitReservation(string $hash, ?string &$token): void
     {
-        if ($this->deduplicator !== null && $token !== null) {
-            $this->deduplicator->commit($hash, $token);
-            $token = null;
-        }
-    }
-
-    private function releaseReservation(string $hash, ?string &$token): void
-    {
         if ($this->deduplicator === null || $token === null) {
             return;
         }
-        $releaseToken = $token;
+        $commitToken = $token;
         $token = null;
         try {
-            $this->deduplicator->release($hash, $releaseToken);
+            $this->deduplicator->commit($hash, $commitToken);
         } catch (Throwable) {
-            try { $this->logger->log('failure', $hash, 'dedup_store_failure', null); } catch (Throwable) {}
+            try {
+                $this->logger->log('failure', $hash, 'dedup_store_failure', null);
+            } catch (Throwable) {
+                // An uncertain commit must never release the reservation or create another incident.
+            }
         }
     }
 
