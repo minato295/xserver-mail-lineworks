@@ -50,7 +50,7 @@ PHP本体、`vendor/`、設定、ログ、配備時の一時ファイルは、�
 
 秘密設定は `config/config.example.json` を参照して公開領域外に作成します。通常配送で使う `webhook_url`、1件以上のメールアドレスを持つ `error_recipients` 配列、`log_path` を設定し、テスト用強制失敗項目は通常 `null` のままにします。Webhook URLをREADME、チケット、Git差分へ貼り付けないでください。認証済みシステムメール用の `system_mail_hmac_key` は管理CLIが欠損時だけ生成して秘密設定へ保存するため、例示値を作成したり画面、ログ、チケットへ転記したりしないでください。
 
-`notification_base_address` には転送先となる基準アドレスを設定します。配送済みメッセージの重複抑止状態を保存する `dedup_path` は絶対パスで指定し、設定やログと同様に必ず `public_html` 外（例: `/home/example/private/state/`）へ置いてください。旧設定に `dedup_path` がない場合だけ、検証済みの非公開 `log_path` と同じディレクトリの `delivery-dedup.json` を使用します（親0700、ファイル600）。明示値が相対パス、symlink、または `public_html` 内なら起動検査は失敗します。
+`notification_base_address` には転送先となる基準アドレスを設定します。配送済みメッセージの重複抑止状態を保存する `dedup_path` は絶対パスで指定し、設定やログと同様に必ず `public_html` 外（例: `/home/example/private/state/`）へ置いてください。旧設定に `dedup_path` がない場合だけ、検証済みの非公開 `log_path` と同じディレクトリの `delivery-dedup.json` を使用します（親0700、ファイル600）。予約を取得したメールは通常Webhookの成功または最終失敗のいずれでも処理完了として600秒間確定し、同じMessage-IDはその間に再通知しません。初回5xx等に対するプロセス内の1回だけの再送が尽きた後も、元メールはメールボックスに残り、同じMessage-IDをTTL内で自動再試行しません。明示値が相対パス、symlink、または `public_html` 内なら起動検査は失敗します。
 
 ## Xserverメール振り分け
 

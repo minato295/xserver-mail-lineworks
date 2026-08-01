@@ -1663,7 +1663,7 @@ $retryApplication = new DeliveryApplication($retryWebhook, $retryReporter, $dedu
 $retryRaw = str_replace('<same@example.invalid>', '<retry@example.invalid>', $sameRaw);
 $retryApplication->deliver($retryRaw);
 $retryApplication->deliver($retryRaw);
-deliveryCheck($retryCalls === 3, 'Failed webhook delivery must release its reservation so the message can be retried');
+deliveryCheck($retryCalls === 2, 'Final webhook failure must remain claimed after its one in-process retry');
 
 $throwingReporter = new ErrorReporter(
     new WebhookClient('https://webhook.worksmobile.com/message/test', static fn (): array => response(500, 'server error')),
@@ -1678,7 +1678,95 @@ $reporterRetryRaw = str_replace('<same@example.invalid>', '<reporter-retry@examp
 $reporterRetryApplication = new DeliveryApplication($reporterDeliveryWebhook, $throwingReporter, $dedupLogger, null, $appDedup);
 $reporterRetryApplication->deliver($reporterRetryRaw);
 $reporterRetryApplication->deliver($reporterRetryRaw);
-deliveryCheck($reporterDeliveryCalls === 3, 'Reporter failure must not prevent reservation release and later retry');
+deliveryCheck($reporterDeliveryCalls === 2, 'Reporter failure must not make a completed failed delivery eligible again');
+
+$failedDeliveryPrimaryCalls = 0;
+$failedDeliveryAlertCalls = 0;
+$failedDeliveryLog = $appDedupDirectory . '/failed-delivery.log';
+$failedDeliveryLogger = new OperationalLogger($failedDeliveryLog);
+$failedDeliveryApplication = new DeliveryApplication(
+    new WebhookClient(
+        'https://webhook.worksmobile.com/message/test',
+        static function () use (&$failedDeliveryPrimaryCalls): array {
+            ++$failedDeliveryPrimaryCalls;
+            return response(500, 'server error');
+        },
+        32_768,
+        static function (): void {},
+    ),
+    new ErrorReporter(
+        new WebhookClient(
+            'https://webhook.worksmobile.com/message/error-test',
+            static function () use (&$failedDeliveryAlertCalls): array {
+                ++$failedDeliveryAlertCalls;
+                return response(200, 'success');
+            },
+        ),
+        $failedDeliveryLogger,
+    ),
+    $failedDeliveryLogger,
+    null,
+    new DeliveryDeduplicator($appDedupDirectory . '/failed-delivery-claims.json'),
+);
+$failedDeliveryRaw = str_replace('<same@example.invalid>', '<failed-delivery@example.invalid>', $sameRaw);
+$failedDeliveryApplication->deliver($failedDeliveryRaw);
+$failedDeliveryApplication->deliver($failedDeliveryRaw);
+$failedDeliveryEvents = array_map(
+    static fn (string $line): array => json_decode($line, true, 16, JSON_THROW_ON_ERROR),
+    array_values(array_filter(explode("\n", (string) file_get_contents($failedDeliveryLog)))),
+);
+deliveryCheck($failedDeliveryPrimaryCalls === 2,
+    'Duplicate final failures must make exactly one two-attempt primary webhook delivery');
+deliveryCheck($failedDeliveryAlertCalls === 1
+    && count(array_filter($failedDeliveryEvents, static fn (array $event): bool => $event['outcome'] === 'success'
+        && $event['classification'] === 'internal_error')) === 1,
+    'Duplicate final failures must send and log exactly one successful error alert');
+
+$ambiguousCommitPrimaryCalls = 0;
+$ambiguousCommitAlertCalls = 0;
+$ambiguousCommitLog = $appDedupDirectory . '/ambiguous-commit.log';
+$ambiguousCommitClaims = $appDedupDirectory . '/ambiguous-commit-claims.json';
+$ambiguousCommitLogger = new OperationalLogger($ambiguousCommitLog);
+$ambiguousCommitApplication = new DeliveryApplication(
+    new WebhookClient(
+        'https://webhook.worksmobile.com/message/test',
+        static function () use (&$ambiguousCommitPrimaryCalls, $ambiguousCommitClaims): array {
+            ++$ambiguousCommitPrimaryCalls;
+            $claims = json_decode((string) file_get_contents($ambiguousCommitClaims), true, 16, JSON_THROW_ON_ERROR);
+            $hash = array_key_first($claims);
+            deliveryCheck(is_string($hash), 'Ambiguous commit test must observe its reservation');
+            $claims[$hash] = ['status' => 'committed', 'timestamp' => time()];
+            file_put_contents($ambiguousCommitClaims, json_encode((object) $claims, JSON_THROW_ON_ERROR) . "\n");
+            chmod($ambiguousCommitClaims, 0600);
+            return response(200, 'success');
+        },
+    ),
+    new ErrorReporter(
+        new WebhookClient(
+            'https://webhook.worksmobile.com/message/error-test',
+            static function () use (&$ambiguousCommitAlertCalls): array {
+                ++$ambiguousCommitAlertCalls;
+                return response(200, 'success');
+            },
+        ),
+        $ambiguousCommitLogger,
+    ),
+    $ambiguousCommitLogger,
+    null,
+    new DeliveryDeduplicator($ambiguousCommitClaims),
+);
+$ambiguousCommitRaw = str_replace('<same@example.invalid>', '<ambiguous-commit@example.invalid>', $sameRaw);
+$ambiguousCommitApplication->deliver($ambiguousCommitRaw);
+$ambiguousCommitApplication->deliver($ambiguousCommitRaw);
+$ambiguousCommitEvents = array_map(
+    static fn (string $line): array => json_decode($line, true, 16, JSON_THROW_ON_ERROR),
+    array_values(array_filter(explode("\n", (string) file_get_contents($ambiguousCommitLog)))),
+);
+deliveryCheck($ambiguousCommitPrimaryCalls === 1 && $ambiguousCommitAlertCalls === 0,
+    'An ambiguous commit failure must not release or redeliver a completed reservation or alert on its own');
+deliveryCheck(count(array_filter($ambiguousCommitEvents,
+    static fn (array $event): bool => $event['classification'] === 'dedup_store_failure')) === 1,
+    'An ambiguous commit failure must record one safe dedup-store event');
 
 $failedStorePath = $appDedupDirectory . '/missing/claims.json';
 $failedStore = new DeliveryDeduplicator($failedStorePath);
@@ -1721,6 +1809,43 @@ unlink($reportFailureLog);
 rmdir($reportFailureDirectory);
 
 $forcedRaw = "From: sender@example.invalid\r\nTo: target@example.invalid\r\nSubject: [Error Test {$testToken}]\r\nMessage-ID: <forced@example.invalid>\r\n\r\nSecret body";
+
+$forcedDedupDirectory = sys_get_temp_dir() . '/delivery-forced-dedup-' . bin2hex(random_bytes(8));
+mkdir($forcedDedupDirectory, 0700);
+$forcedDedupLog = $forcedDedupDirectory . '/operational.jsonl';
+$forcedDedupHttpCalls = 0;
+$forcedDedupApplication = new DeliveryApplication(
+    new WebhookClient(
+        'https://webhook.worksmobile.com/message/test',
+        static function () use (&$forcedDedupHttpCalls): array {
+            ++$forcedDedupHttpCalls;
+            return response(200, 'success');
+        },
+    ),
+    new ErrorReporter(
+        new WebhookClient('https://webhook.worksmobile.com/message/error-test'),
+        new OperationalLogger($forcedDedupLog),
+    ),
+    new OperationalLogger($forcedDedupLog),
+    $armedConfig,
+    new DeliveryDeduplicator($forcedDedupDirectory . '/claims.json'),
+    null,
+    null,
+    static fn (): DateTimeImmutable => new DateTimeImmutable('2026-07-13T12:00:00+00:00'),
+);
+$forcedDedupApplication->deliver($forcedRaw);
+$forcedDedupApplication->deliver($forcedRaw);
+$forcedDedupEvents = array_map(
+    static fn (string $line): array => json_decode($line, true, 16, JSON_THROW_ON_ERROR),
+    array_values(array_filter(explode("\n", (string) file_get_contents($forcedDedupLog)))),
+);
+deliveryCheck($forcedDedupHttpCalls === 0
+    && count(array_filter($forcedDedupEvents,
+        static fn (array $event): bool => $event['classification'] === 'forced_test_failure')) === 1,
+    'A duplicate forced error must be suppressed after its first logical failure is recorded');
+foreach (glob($forcedDedupDirectory . '/*') ?: [] as $file) { if (is_file($file)) unlink($file); }
+foreach (glob($forcedDedupDirectory . '/.*') ?: [] as $file) { if (is_file($file)) unlink($file); }
+rmdir($forcedDedupDirectory);
 
 $healthDirectory = sys_get_temp_dir() . '/delivery-health-integration-' . bin2hex(random_bytes(8));
 mkdir($healthDirectory, 0700);
@@ -1953,6 +2078,63 @@ deliveryCheck($decodedTestRecovery['subject'] === '【テスト・対応不要�
     && $decodedTestRecovery['body'] === $expectedTestRecoveryBody,
     'Forced recovery subject and body must match the approved Japanese copy');
 
+$duplicateOutageDirectory = sys_get_temp_dir() . '/delivery-duplicate-outage-' . bin2hex(random_bytes(8));
+mkdir($duplicateOutageDirectory, 0700);
+$duplicateOutageDirectory = realpath($duplicateOutageDirectory);
+deliveryCheck(is_string($duplicateOutageDirectory), 'Duplicate outage directory must resolve');
+$duplicateOutageLog = $duplicateOutageDirectory . '/operational.jsonl';
+$duplicateOutageAdapter = new DeliverySendmailAdapter();
+$duplicateOutageMonitor = new DeliveryHealthMonitor(
+    $duplicateOutageDirectory . '/delivery-health.json', ['operator@example.invalid'], $duplicateOutageLog,
+    $healthAuth,
+    new SendmailClient($duplicateOutageAdapter, static fn (): float => 0.0, static fn (): bool => true),
+    new OperationalLogger($duplicateOutageLog),
+    new NativePrivateStateFilesystem(
+        static fn (): string => str_repeat('8', 32), null,
+        static fn (): array => ['home' => dirname($duplicateOutageDirectory), 'uid' => posix_geteuid()],
+    ),
+    static fn (): DateTimeImmutable => new DateTimeImmutable('2026-07-13T12:00:00+00:00'),
+    static fn (): string => str_repeat('9', 32),
+);
+$duplicateOutagePrimaryCalls = 0;
+$duplicateOutageAlertCalls = 0;
+$duplicateOutagePrimary = new WebhookClient(
+    'https://webhook.example.invalid/message/test',
+    static function () use (&$duplicateOutagePrimaryCalls): array {
+        ++$duplicateOutagePrimaryCalls;
+        return response(500, 'server error');
+    },
+    32_768,
+    static function (): void {},
+    $duplicateOutageMonitor,
+);
+$duplicateOutageAlert = new WebhookClient(
+    'https://webhook.example.invalid/message/error-test',
+    static function () use (&$duplicateOutageAlertCalls): array {
+        ++$duplicateOutageAlertCalls;
+        return response(500, 'server error');
+    },
+    32_768,
+    static function (): void {},
+    $duplicateOutageMonitor,
+);
+$duplicateOutageApplication = new DeliveryApplication(
+    $duplicateOutagePrimary,
+    new ErrorReporter($duplicateOutageAlert, new OperationalLogger($duplicateOutageLog), $duplicateOutageMonitor),
+    new OperationalLogger($duplicateOutageLog),
+    null,
+    new DeliveryDeduplicator($duplicateOutageDirectory . '/claims.json'),
+    null,
+    $duplicateOutageMonitor,
+);
+$duplicateOutageRaw = str_replace('<same@example.invalid>', '<duplicate-outage@example.invalid>', $sameRaw);
+$duplicateOutageApplication->deliver($duplicateOutageRaw);
+$duplicateOutageApplication->deliver($duplicateOutageRaw);
+deliveryCheck($duplicateOutagePrimaryCalls === 2 && $duplicateOutageAlertCalls === 2
+    && count($duplicateOutageAdapter->messages) === 1
+    && $duplicateOutageMonitor->status() === 'degraded',
+    'Duplicate failed deliveries must create one error-alert retry pair and one degraded outage transition');
+
 $preflightDirectory = sys_get_temp_dir() . '/delivery-preflight-' . bin2hex(random_bytes(8));
 mkdir($preflightDirectory, 0700);
 $preflightDirectory = realpath($preflightDirectory);
@@ -2029,7 +2211,7 @@ foreach ([
     deliveryCheck($preflightHttp > $callsBefore, $forgeryName . ' system headers must follow ordinary delivery');
 }
 
-foreach ([$healthDirectory, $forcedHealthDirectory, $preflightDirectory] as $cleanupDirectory) {
+foreach ([$healthDirectory, $forcedHealthDirectory, $duplicateOutageDirectory, $preflightDirectory] as $cleanupDirectory) {
     foreach (glob($cleanupDirectory . '/*') ?: [] as $file) { if (is_file($file)) unlink($file); }
     foreach (glob($cleanupDirectory . '/.*') ?: [] as $file) { if (is_file($file)) unlink($file); }
     rmdir($cleanupDirectory);
