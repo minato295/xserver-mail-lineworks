@@ -218,10 +218,20 @@ final class OperationalLogger
                 throw new RuntimeException('Operational log unavailable');
             }
             if (!$diagnostic->recoveredByRetry) {
-                if ($relevantIndex !== 0 || $this->attemptClassification($relevant) !== 'invalid_parameter') {
+                $isDirectInvalidParameterFallback = $relevantIndex === 0;
+                $isRetryThenInvalidParameterFallback = $relevantIndex === 1
+                    && ($attempts[0]['http_status'] === 429
+                        || ($attempts[0]['http_status'] >= 500 && $attempts[0]['http_status'] <= 599));
+                $isCompatibilityThenInvalidParameterFallback = $relevantIndex === 2
+                    && $attempts[0]['http_status'] === 500
+                    && $attempts[1]['http_status'] === 500;
+                if ((!$isDirectInvalidParameterFallback
+                        && !$isRetryThenInvalidParameterFallback
+                        && !$isCompatibilityThenInvalidParameterFallback)
+                    || $this->attemptClassification($relevant) !== 'invalid_parameter') {
                     throw new RuntimeException('Operational log unavailable');
                 }
-                foreach (array_slice($attempts, 1) as $attempt) {
+                foreach (array_slice($attempts, $relevantIndex + 1) as $attempt) {
                     if (!$this->isSuccessfulAttempt($attempt)) {
                         throw new RuntimeException('Operational log unavailable');
                     }
@@ -287,7 +297,7 @@ final class OperationalLogger
             'transport_error' => 'transport_error',
             'invalid_json' => 'http_error',
             default => match ($attempt['provider_description']) {
-                'invalid parameter' => 'invalid_parameter',
+                'invalid parameter', 'limit exceeded (body.text length exceeds 2000)' => 'invalid_parameter',
                 'missing parameter' => 'missing_parameter',
                 'invalid webhook URL' => 'invalid_webhook_url',
                 'too many request' => 'rate_limited',

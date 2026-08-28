@@ -527,6 +527,159 @@ $smallInvalid = new WebhookClient(
 );
 deliveryCheck(!$smallInvalid->send('Title', 'short')->isSuccess() && $smallCalls === 1, 'Invalid parameter under soft cap must not split');
 
+$lineWorksLengthPayloads = [];
+$lineWorksLengthClient = new WebhookClient(
+    'https://webhook.worksmobile.com/message/test-placeholder',
+    static function (string $url, string $payload) use (&$lineWorksLengthPayloads): array {
+        $lineWorksLengthPayloads[] = $payload;
+        return count($lineWorksLengthPayloads) === 1
+            ? response(400, 'limit exceeded (body.text length exceeds 2000)')
+            : response(200, 'success');
+    },
+);
+$lineWorksLengthText = str_repeat('日本語の本文です。', 260)
+    . "\n引用前の区切りです。\n"
+    . str_repeat('補足🙂', 180);
+$lineWorksLengthResult = $lineWorksLengthClient->send('長文メール', $lineWorksLengthText);
+deliveryCheck($lineWorksLengthResult->isSuccess(),
+    'Observed LINE WORKS body.text length rejection must recover by bounded chunks');
+deliveryCheck(count($lineWorksLengthPayloads) > 2,
+    'LINE WORKS length recovery must follow the rejected full request with multiple chunks');
+$lineWorksRecoveredText = '';
+$lineWorksChunkCount = count($lineWorksLengthPayloads) - 1;
+foreach (array_slice($lineWorksLengthPayloads, 1) as $index => $payload) {
+    $chunkPayload = json_decode($payload, true, 512, JSON_THROW_ON_ERROR);
+    $chunkText = $chunkPayload['body']['text'];
+    $marker = sprintf('(%d/%d) ', $index + 1, $lineWorksChunkCount);
+    deliveryCheck(str_starts_with($chunkText, $marker),
+        'LINE WORKS length chunks must have deterministic sequence markers');
+    $utf16Units = 0;
+    foreach (preg_split('//u', $chunkText, -1, PREG_SPLIT_NO_EMPTY) ?: [] as $character) {
+        $utf16Units += strlen($character) === 4 ? 2 : 1;
+    }
+    deliveryCheck($utf16Units <= 2000,
+        'Each LINE WORKS body.text chunk including its marker must fit 2000 UTF-16 units');
+    $lineWorksRecoveredText .= substr($chunkText, strlen($marker));
+}
+deliveryCheck($lineWorksRecoveredText === $lineWorksLengthText,
+    'LINE WORKS length recovery must preserve the complete original text and separators');
+deliveryCheck($lineWorksLengthResult->diagnostic?->attemptHttpStatuses()[0] === 400,
+    'LINE WORKS length diagnostics must retain the authoritative rejected request');
+
+$lineWorksEchoCalls = 0;
+$lineWorksEchoClient = new WebhookClient(
+    'https://webhook.worksmobile.com/message/test-placeholder',
+    static function () use (&$lineWorksEchoCalls): array {
+        ++$lineWorksEchoCalls;
+        return $lineWorksEchoCalls === 1
+            ? response(400, 'limit exceeded (body.text length exceeds 2000)')
+            : response(200, 'success');
+    },
+);
+$lineWorksEchoText = '転送された診断: limit exceeded (body.text length exceeds 2000) '
+    . str_repeat('本文', 1050);
+$lineWorksEchoResult = $lineWorksEchoClient->send('転送メール', $lineWorksEchoText);
+deliveryCheck($lineWorksEchoResult->isSuccess() && $lineWorksEchoCalls > 2,
+    'Private diagnostic redaction must not suppress the non-persisted LINE WORKS length recovery signal');
+deliveryCheck($lineWorksEchoResult->diagnostic?->attempts[0]->providerDescription
+    === 'limit exceeded (body.text length exceeds 2000)',
+    'The fixed public LINE WORKS length description must remain loggable even when echoed by the payload');
+
+$retryLengthResults = [];
+foreach ([
+    'server' => response(500, 'server error'),
+    'rate-limit' => response(429, 'too many request', ['RateLimit-Reset' => '0']),
+] as $retryLengthLabel => $retryLengthFirstResponse) {
+    $retryLengthCalls = 0;
+    $retryLengthClient = new WebhookClient(
+        'https://webhook.worksmobile.com/message/test-placeholder',
+        static function () use (&$retryLengthCalls, $retryLengthFirstResponse): array {
+            ++$retryLengthCalls;
+            return match ($retryLengthCalls) {
+                1 => $retryLengthFirstResponse,
+                2 => response(400, 'limit exceeded (body.text length exceeds 2000)'),
+                default => response(200, 'success'),
+            };
+        },
+        32_768,
+        static function (): void {},
+    );
+    $retryLengthResult = $retryLengthClient->send('再試行後の長文', str_repeat('本文', 1100));
+    deliveryCheck($retryLengthResult->isSuccess() && $retryLengthCalls > 3,
+        $retryLengthLabel . ' retry followed by the exact length rejection must recover by chunks');
+    $retryLengthResults[$retryLengthLabel] = $retryLengthResult;
+}
+
+$combinedFallbackPayloads = [];
+$combinedFallbackResponses = [
+    response(500, 'server error'),
+    response(500, 'server error'),
+    response(400, 'limit exceeded (body.text length exceeds 2000)'),
+];
+$combinedFallbackClient = new WebhookClient(
+    'https://webhook.worksmobile.com/message/test-placeholder',
+    static function (string $url, string $payload) use (&$combinedFallbackPayloads, &$combinedFallbackResponses): array {
+        $combinedFallbackPayloads[] = $payload;
+        return $combinedFallbackResponses !== []
+            ? array_shift($combinedFallbackResponses)
+            : response(200, 'success');
+    },
+    32_768,
+    static function (): void {},
+);
+$combinedFallbackText = str_repeat('長文本文', 540) . "\nhttps://www.example.invalid/path";
+$combinedFallbackResult = $combinedFallbackClient->sendWithCompatibility('長文通知', $combinedFallbackText);
+deliveryCheck($combinedFallbackResult->isSuccess() && count($combinedFallbackPayloads) > 4,
+    'Compatibility 500 recovery followed by the exact length rejection must continue into chunks');
+deliveryCheck($combinedFallbackPayloads[0] === $combinedFallbackPayloads[1],
+    'Combined recovery must retain the identical canonical 500 retry');
+$combinedCompatibilityPayload = json_decode($combinedFallbackPayloads[2], true, 512, JSON_THROW_ON_ERROR);
+deliveryCheck(str_contains($combinedCompatibilityPayload['body']['text'], 'https：//www．example.invalid/path'),
+    'Combined recovery must retain the compatibility transformation before chunking');
+$combinedRecoveredText = '';
+$combinedChunkCount = count($combinedFallbackPayloads) - 3;
+foreach (array_slice($combinedFallbackPayloads, 3) as $index => $payload) {
+    $chunkPayload = json_decode($payload, true, 512, JSON_THROW_ON_ERROR);
+    $marker = sprintf('(%d/%d) ', $index + 1, $combinedChunkCount);
+    deliveryCheck(str_starts_with($chunkPayload['body']['text'], $marker),
+        'Combined recovery chunks must retain deterministic sequence markers');
+    $combinedRecoveredText .= substr($chunkPayload['body']['text'], strlen($marker));
+}
+deliveryCheck($combinedRecoveredText === str_replace(
+    ['https://', 'www.'], ['https：//', 'www．'], $combinedFallbackText,
+), 'Combined recovery chunks must preserve the complete compatibility text');
+
+$chunkCompatibilityPayloads = [];
+$chunkCompatibilityResponses = [
+    response(400, 'limit exceeded (body.text length exceeds 2000)'),
+    response(500, 'server error'),
+    response(500, 'server error'),
+    response(200, 'success'),
+];
+$chunkCompatibilityClient = new WebhookClient(
+    'https://webhook.worksmobile.com/message/test-placeholder',
+    static function (string $url, string $payload) use (&$chunkCompatibilityPayloads, &$chunkCompatibilityResponses): array {
+        $chunkCompatibilityPayloads[] = $payload;
+        return $chunkCompatibilityResponses !== []
+            ? array_shift($chunkCompatibilityResponses)
+            : response(200, 'success');
+    },
+    32_768,
+    static function (): void {},
+);
+$chunkCompatibilityText = 'https://www.example.invalid/path ' . str_repeat('本文', 1100);
+$chunkCompatibilityResult = $chunkCompatibilityClient->sendWithCompatibility(
+    '長文通知', $chunkCompatibilityText,
+);
+deliveryCheck($chunkCompatibilityResult->isSuccess() && count($chunkCompatibilityPayloads) > 4,
+    'Each length-recovery chunk must retain the existing canonical double-500 compatibility rescue');
+deliveryCheck($chunkCompatibilityPayloads[1] === $chunkCompatibilityPayloads[2]
+    && $chunkCompatibilityPayloads[2] !== $chunkCompatibilityPayloads[3],
+    'Chunk compatibility rescue must retry canonical bytes twice before one transformed request');
+$chunkCompatibilityFallback = json_decode($chunkCompatibilityPayloads[3], true, 512, JSON_THROW_ON_ERROR);
+deliveryCheck(str_contains($chunkCompatibilityFallback['body']['text'], 'https：//www．example.invalid/path'),
+    'Chunk compatibility rescue must retain URL neutralization');
+
 $compatibilityPayloads = [];
 $compatibilityResponses = [response(500, 'server error'), response(500, 'server error'), response(200, 'success')];
 $compatibilityClient = new WebhookClient(
@@ -669,6 +822,44 @@ deliveryCheck(array_keys($compatibilityRecoveryEvent) === [
     && $compatibilityRecoveryEvent['recovered_by_retry'] === true
     && !str_contains((string) file_get_contents($compatibilityRecoveryLogPath), 'Example.INVALID'),
     'Operational logging must accept three-attempt compatibility recovery without payload content');
+
+$lineWorksLengthRecoveryLogPath = $logDirectory . '/lineworks-length-recovery.jsonl';
+(new OperationalLogger($lineWorksLengthRecoveryLogPath))->log(
+    'success', str_repeat('6', 64), $lineWorksLengthResult->classification,
+    $lineWorksLengthResult->httpStatus, $lineWorksLengthResult->diagnostic,
+);
+$lineWorksLengthRecoveryEvent = json_decode(
+    (string) file_get_contents($lineWorksLengthRecoveryLogPath), true, 512, JSON_THROW_ON_ERROR,
+);
+deliveryCheck($lineWorksLengthRecoveryEvent['attempt_http_statuses'][0] === 400
+    && end($lineWorksLengthRecoveryEvent['attempt_http_statuses']) === 200
+    && $lineWorksLengthRecoveryEvent['provider_description'] === 'limit exceeded (body.text length exceeds 2000)',
+    'Operational logging must accept LINE WORKS length recovery without payload content');
+
+$combinedFallbackRecoveryLogPath = $logDirectory . '/combined-fallback-recovery.jsonl';
+(new OperationalLogger($combinedFallbackRecoveryLogPath))->log(
+    'success', str_repeat('5', 64), $combinedFallbackResult->classification,
+    $combinedFallbackResult->httpStatus, $combinedFallbackResult->diagnostic,
+);
+$combinedFallbackRecoveryEvent = json_decode(
+    (string) file_get_contents($combinedFallbackRecoveryLogPath), true, 512, JSON_THROW_ON_ERROR,
+);
+deliveryCheck(array_slice($combinedFallbackRecoveryEvent['attempt_http_statuses'], 0, 3) === [500, 500, 400]
+    && end($combinedFallbackRecoveryEvent['attempt_http_statuses']) === 200,
+    'Operational logging must accept compatibility plus length recovery without payload content');
+
+$lineWorksEchoRecoveryLogPath = $logDirectory . '/lineworks-echo-recovery.jsonl';
+(new OperationalLogger($lineWorksEchoRecoveryLogPath))->log(
+    'success', str_repeat('4', 64), $lineWorksEchoResult->classification,
+    $lineWorksEchoResult->httpStatus, $lineWorksEchoResult->diagnostic,
+);
+foreach ($retryLengthResults as $retryLengthLabel => $retryLengthResult) {
+    $retryLengthLogPath = $logDirectory . '/retry-length-' . $retryLengthLabel . '.jsonl';
+    (new OperationalLogger($retryLengthLogPath))->log(
+        'success', str_repeat('3', 64), $retryLengthResult->classification,
+        $retryLengthResult->httpStatus, $retryLengthResult->diagnostic,
+    );
+}
 $echoLogPath = $logDirectory . '/provider-echo.jsonl';
 (new OperationalLogger($echoLogPath))->log(
     'failure', str_repeat('9', 64), $echoResult->classification,
@@ -1356,6 +1547,12 @@ unlink($flushFaultPath);
 unlink($afterRenameFaultPath);
 unlink($restartPath);
 unlink($compatibilityRecoveryLogPath);
+unlink($lineWorksLengthRecoveryLogPath);
+unlink($combinedFallbackRecoveryLogPath);
+unlink($lineWorksEchoRecoveryLogPath);
+foreach (array_keys($retryLengthResults) as $retryLengthLabel) {
+    unlink($logDirectory . '/retry-length-' . $retryLengthLabel . '.jsonl');
+}
 if (isset($parallelPath) && file_exists($parallelPath)) {
     unlink($parallelPath);
 }
