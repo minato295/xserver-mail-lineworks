@@ -68,6 +68,10 @@ final class ObservedWebhookResult
 
 final class WebhookClient
 {
+    private const LINE_WORKS_TEXT_LIMIT_DESCRIPTION = 'limit exceeded (body.text length exceeds 2000)';
+    private const LINE_WORKS_TEXT_LIMIT_UNITS = 2000;
+    private const LINE_WORKS_MARKER_RESERVE_UNITS = 20;
+
     private readonly Closure $transport;
     private readonly Closure $sleeper;
 
@@ -118,6 +122,8 @@ final class WebhookClient
 
         $sequence = $this->healthMonitor?->reserveObservation();
         $request = $this->requestWithRateLimitRetry($payload, $title, $text);
+        $deliveryTitle = $title;
+        $deliveryText = $text;
         if ($allowCompatibility && $this->shouldUseCompatibility($request)) {
             [$compatibilityTitle, $compatibilityText] = $this->compatibilityValues($title, $text);
             $compatibilityPayload = $this->payload($compatibilityTitle, $compatibilityText);
@@ -127,11 +133,17 @@ final class WebhookClient
                     'result' => $compatibility['result'],
                     'attempts' => [...$request['attempts'], $compatibility['attempt']],
                     'recoveredByRetry' => $compatibility['result']->isSuccess(),
+                    'lineWorksTextLimitExceeded' => $compatibility['lineWorksTextLimitExceeded'],
                 ];
-                return new ObservedWebhookResult(
-                    $this->withDiagnostic($request, $payload, $title, $text),
-                    $sequence,
-                );
+                if ($compatibility['result']->isSuccess()
+                    || !$compatibility['lineWorksTextLimitExceeded']) {
+                    return new ObservedWebhookResult(
+                        $this->withDiagnostic($request, $payload, $title, $text),
+                        $sequence,
+                    );
+                }
+                $deliveryTitle = $compatibilityTitle;
+                $deliveryText = $compatibilityText;
             }
         }
         $result = $this->withDiagnostic($request, $payload, $title, $text);
@@ -139,27 +151,47 @@ final class WebhookClient
             return new ObservedWebhookResult($result, $sequence);
         }
 
+        $lineWorksTextLimitExceeded = $request['lineWorksTextLimitExceeded'];
         if ($result->httpStatus !== 400
             || $result->classification !== 'invalid_parameter'
-            || strlen($payload) <= $this->softCapBytes) {
+            || (!$lineWorksTextLimitExceeded && strlen($payload) <= $this->softCapBytes)) {
             return new ObservedWebhookResult($result, $sequence);
         }
 
-        $chunks = $this->splitText($text);
+        $chunks = $lineWorksTextLimitExceeded
+            ? $this->splitLineWorksText($deliveryText)
+            : $this->splitText($deliveryText);
         $count = count($chunks);
         $attempts = $request['attempts'];
         $recoveredByRetry = $request['recoveredByRetry'];
         foreach ($chunks as $index => $chunk) {
             $chunkText = sprintf('(%d/%d) %s', $index + 1, $count, $chunk);
             try {
-                $chunkPayload = $this->payload($title, $chunkText);
+                $chunkPayload = $this->payload($deliveryTitle, $chunkText);
             } catch (JsonException) {
                 return new ObservedWebhookResult(
                     new WebhookResult(false, null, 'invalid_payload'),
                     $sequence,
                 );
             }
-            $chunkRequest = $this->requestWithRateLimitRetry($chunkPayload, $title, $chunkText);
+            $chunkRequest = $this->requestWithRateLimitRetry($chunkPayload, $deliveryTitle, $chunkText);
+            if ($allowCompatibility && $this->shouldUseCompatibility($chunkRequest)) {
+                [$compatibilityChunkTitle, $compatibilityChunkText] = $this->compatibilityValues(
+                    $deliveryTitle, $chunkText,
+                );
+                $compatibilityChunkPayload = $this->payload($compatibilityChunkTitle, $compatibilityChunkText);
+                if ($compatibilityChunkPayload !== $chunkPayload) {
+                    $compatibilityChunk = $this->request(
+                        $compatibilityChunkPayload, $compatibilityChunkTitle, $compatibilityChunkText,
+                    );
+                    $chunkRequest = [
+                        'result' => $compatibilityChunk['result'],
+                        'attempts' => [...$chunkRequest['attempts'], $compatibilityChunk['attempt']],
+                        'recoveredByRetry' => $compatibilityChunk['result']->isSuccess(),
+                        'lineWorksTextLimitExceeded' => $compatibilityChunk['lineWorksTextLimitExceeded'],
+                    ];
+                }
+            }
             $attempts = [...$attempts, ...$chunkRequest['attempts']];
             $recoveredByRetry = $recoveredByRetry || $chunkRequest['recoveredByRetry'];
             $chunkResult = $this->withDiagnostic(
@@ -184,7 +216,7 @@ final class WebhookClient
         );
     }
 
-    /** @param array{result:WebhookResult,attempts:list<WebhookAttemptDiagnostic>,recoveredByRetry:bool} $request */
+    /** @param array{result:WebhookResult,attempts:list<WebhookAttemptDiagnostic>,recoveredByRetry:bool,lineWorksTextLimitExceeded:bool} $request */
     private function shouldUseCompatibility(array $request): bool
     {
         return array_map(
@@ -233,7 +265,7 @@ final class WebhookClient
     }
 
     /**
-     * @return array{result:WebhookResult,attempts:list<WebhookAttemptDiagnostic>,recoveredByRetry:bool}
+     * @return array{result:WebhookResult,attempts:list<WebhookAttemptDiagnostic>,recoveredByRetry:bool,lineWorksTextLimitExceeded:bool}
      */
     private function requestWithRateLimitRetry(string $payload, string $title, string $text): array
     {
@@ -250,7 +282,12 @@ final class WebhookClient
             }
         }
         if ($delay === null) {
-            return ['result' => $response['result'], 'attempts' => $attempts, 'recoveredByRetry' => false];
+            return [
+                'result' => $response['result'],
+                'attempts' => $attempts,
+                'recoveredByRetry' => false,
+                'lineWorksTextLimitExceeded' => $response['lineWorksTextLimitExceeded'],
+            ];
         }
         ($this->sleeper)($delay);
 
@@ -260,10 +297,11 @@ final class WebhookClient
             'result' => $retry['result'],
             'attempts' => $attempts,
             'recoveredByRetry' => $retry['result']->isSuccess(),
+            'lineWorksTextLimitExceeded' => $retry['lineWorksTextLimitExceeded'],
         ];
     }
 
-    /** @return array{result:WebhookResult,headers:array<string,string>,attempt:WebhookAttemptDiagnostic} */
+    /** @return array{result:WebhookResult,headers:array<string,string>,attempt:WebhookAttemptDiagnostic,lineWorksTextLimitExceeded:bool} */
     private function request(string $payload, string $title, string $text): array
     {
         try {
@@ -281,6 +319,7 @@ final class WebhookClient
                 return [
                     'result' => new WebhookResult(false, $status, 'http_error'),
                     'headers' => $headers,
+                    'lineWorksTextLimitExceeded' => false,
                     'attempt' => new WebhookAttemptDiagnostic(
                         $status, null, null, 'invalid_json', $contentType, $bodyBytes, $bodyHash,
                     ),
@@ -296,15 +335,19 @@ final class WebhookClient
                 $code = $this->safeValue($code, 64);
             }
             $success = $status === 200 && $code === 200 && $description === 'success';
+            $lineWorksTextLimitExceeded = $status === 400
+                && $description === self::LINE_WORKS_TEXT_LIMIT_DESCRIPTION;
             $classification = $success ? 'success' : match ($description) {
-                'invalid parameter' => 'invalid_parameter',
+                'invalid parameter', self::LINE_WORKS_TEXT_LIMIT_DESCRIPTION => 'invalid_parameter',
                 'missing parameter' => 'missing_parameter',
                 'invalid webhook URL' => 'invalid_webhook_url',
                 'too many request' => 'rate_limited',
                 default => 'http_error',
             };
             $diagnosticDescription = $description;
-            if ($description !== '' && $this->isPayloadEcho($description, $title, $text)) {
+            if ($description !== ''
+                && $description !== self::LINE_WORKS_TEXT_LIMIT_DESCRIPTION
+                && $this->isPayloadEcho($description, $title, $text)) {
                 $diagnosticDescription = '';
             }
             $diagnosticCode = $code;
@@ -315,6 +358,7 @@ final class WebhookClient
             return [
                 'result' => new WebhookResult($success, $status, $classification),
                 'headers' => $headers,
+                'lineWorksTextLimitExceeded' => $lineWorksTextLimitExceeded,
                 'attempt' => new WebhookAttemptDiagnostic(
                     $status, $diagnosticCode, $diagnosticDescription === '' ? null : $diagnosticDescription,
                     'json', $contentType, $bodyBytes, $bodyHash,
@@ -324,12 +368,13 @@ final class WebhookClient
             return [
                 'result' => new WebhookResult(false, null, 'transport_error'),
                 'headers' => [],
+                'lineWorksTextLimitExceeded' => false,
                 'attempt' => new WebhookAttemptDiagnostic(null, null, null, 'transport_error', null, 0, null),
             ];
         }
     }
 
-    /** @param array{result:WebhookResult,attempts:list<WebhookAttemptDiagnostic>,recoveredByRetry:bool} $request */
+    /** @param array{result:WebhookResult,attempts:list<WebhookAttemptDiagnostic>,recoveredByRetry:bool,lineWorksTextLimitExceeded:bool} $request */
     private function withDiagnostic(array $request, string $payload, string $title, string $text): WebhookResult
     {
         $result = $request['result'];
@@ -423,6 +468,61 @@ final class WebhookClient
             }
         }
         return false;
+    }
+
+    /** @return list<string> */
+    private function splitLineWorksText(string $text): array
+    {
+        $characters = preg_split('//u', $text, -1, PREG_SPLIT_NO_EMPTY);
+        if ($characters === false || $characters === []) {
+            return [$text];
+        }
+
+        $target = self::LINE_WORKS_TEXT_LIMIT_UNITS - self::LINE_WORKS_MARKER_RESERVE_UNITS;
+        $chunks = [];
+        $current = '';
+        $currentUnits = 0;
+        $lastNewlineByte = null;
+
+        foreach ($characters as $character) {
+            $units = strlen($character) === 4 ? 2 : 1;
+            if ($current !== '' && $currentUnits + $units > $target) {
+                if ($lastNewlineByte !== null) {
+                    $chunks[] = substr($current, 0, $lastNewlineByte);
+                    $current = substr($current, $lastNewlineByte);
+                    $currentUnits = $this->utf16Units($current);
+                } else {
+                    $chunks[] = $current;
+                    $current = '';
+                    $currentUnits = 0;
+                }
+                $lastNewlineByte = strrpos($current, "\n");
+                if ($lastNewlineByte !== false) {
+                    ++$lastNewlineByte;
+                } else {
+                    $lastNewlineByte = null;
+                }
+            }
+            $current .= $character;
+            $currentUnits += $units;
+            if ($character === "\n") {
+                $lastNewlineByte = strlen($current);
+            }
+        }
+        if ($current !== '') {
+            $chunks[] = $current;
+        }
+
+        return $chunks;
+    }
+
+    private function utf16Units(string $value): int
+    {
+        $units = 0;
+        foreach (preg_split('//u', $value, -1, PREG_SPLIT_NO_EMPTY) ?: [] as $character) {
+            $units += strlen($character) === 4 ? 2 : 1;
+        }
+        return $units;
     }
 
     /** @return list<string> */
