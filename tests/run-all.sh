@@ -39,6 +39,7 @@ php -d assert.exception=1 tests/php/test_system_alert_formatter.php
 php -d assert.exception=1 tests/php/test_sendmail_client.php
 php -d assert.exception=1 tests/php/test_health_monitor.php
 php -d assert.exception=1 tests/php/test_delivery.php
+php -d assert.exception=1 tests/php/test_dedup_capacity.php
 php -d assert.exception=1 tests/php/test_stable_bootstrap.php
 php -d assert.exception=1 tests/php/test_release_validator.php
 php -d assert.exception=1 tests/php/test_validate_release_entrypoint.php

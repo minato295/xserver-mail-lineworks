@@ -12,6 +12,9 @@ use RuntimeException;
 final class DeliveryDeduplicator
 {
     private const MAX_STATE_BYTES = 1_048_576;
+    // Older writers could exceed MAX_STATE_BYTES by one claim, then refuse to
+    // read their own output. Bounded migration headroom lets reserve() prune it.
+    private const MAX_LEGACY_READ_BYTES = 2_097_152;
     private const LOCK_BASENAME = '.delivery-dedup.lock';
 
     private readonly string $path;
@@ -149,14 +152,14 @@ final class DeliveryDeduplicator
         try {
             $this->assertOpenedFile($this->path, $handle, $owner);
             $stat = fstat($handle);
-            if (!is_array($stat) || ($stat['size'] ?? self::MAX_STATE_BYTES + 1) > self::MAX_STATE_BYTES) {
+            if (!is_array($stat) || ($stat['size'] ?? self::MAX_LEGACY_READ_BYTES + 1) > self::MAX_LEGACY_READ_BYTES) {
                 throw new RuntimeException('Invalid deduplication state');
             }
-            $contents = stream_get_contents($handle, self::MAX_STATE_BYTES + 1);
+            $contents = stream_get_contents($handle, self::MAX_LEGACY_READ_BYTES + 1);
         } finally {
             fclose($handle);
         }
-        if (!is_string($contents) || strlen($contents) > self::MAX_STATE_BYTES) {
+        if (!is_string($contents) || strlen($contents) > self::MAX_LEGACY_READ_BYTES) {
             throw new RuntimeException('Deduplication store unavailable');
         }
         try {
@@ -193,6 +196,9 @@ final class DeliveryDeduplicator
             $json = json_encode((object) $claims, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES) . "\n";
         } catch (JsonException $error) {
             throw new RuntimeException('Deduplication store unavailable', 0, $error);
+        }
+        if (strlen($json) > self::MAX_STATE_BYTES) {
+            throw new RuntimeException('Deduplication capacity exceeded');
         }
         $temporary = $directory . DIRECTORY_SEPARATOR . '.' . basename($this->path) . '.tmp.' . bin2hex(random_bytes(16));
         $handle = @fopen($temporary, 'x+b');
