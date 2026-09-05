@@ -365,7 +365,21 @@ class RemoteValidatorTest(unittest.TestCase):
                         root, relative, value, expected_sha256=expected, mode=mode,
                         expected_hosts=["remote.example.invalid"],
                     )
+
                 self.assertEqual([], runner.calls)
+
+    def test_fixed_helper_provision_accepts_pinned_legacy_helper_size(self):
+        body = b"<?php /*" + b"x" * 69206 + b"*/\n"
+        validator, runner = self.make([
+            completed(self.ssh_g()), completed(b'{"status":"changed"}'),
+        ])
+        self.assertEqual("changed", validator.provision_fixed_helper(
+            "/home/example/private/xserver-mail-lineworks",
+            "bootstrap/manage-private-config.php", body,
+            expected_sha256=hashlib.sha256(body).hexdigest(), mode=0o700,
+            expected_hosts=["remote.example.invalid"],
+        ))
+        self.assertLess(len(runner.calls[1][1]), 131072)
 
     def test_fixed_helper_provision_rechecks_trust_before_write(self):
         body = b"<?php valid;\n"

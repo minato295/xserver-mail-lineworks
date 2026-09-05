@@ -70,17 +70,21 @@ EXPECTED_BUNDLE_FILES = {
     "Contents/Resources/manager/scope_journal.py",
     "Contents/Resources/manager/private_config_ssh.py",
     "Contents/Resources/manager/email_address.py",
+    "Contents/Resources/manager/recovery.py",
     "Contents/Resources/fixed-runtime/manage-private-config.php",
     "Contents/Resources/fixed-runtime/legacy-manifest.json",
     "Contents/Resources/fixed-runtime/generation-b9fd468-manifest.json",
 }
+_PRE_RECOVERY_BUNDLE_FILES = frozenset(
+    EXPECTED_BUNDLE_FILES - {"Contents/Resources/manager/recovery.py"}
+)
 _PRE_GENERATION_ASSET_BUNDLE_FILES = frozenset(
-    EXPECTED_BUNDLE_FILES - {
+    _PRE_RECOVERY_BUNDLE_FILES - {
         "Contents/Resources/fixed-runtime/generation-b9fd468-manifest.json",
     }
 )
 _PRE_BOOTSTRAP_ASSET_BUNDLE_FILES = frozenset(
-    EXPECTED_BUNDLE_FILES - {
+    _PRE_RECOVERY_BUNDLE_FILES - {
         "Contents/Resources/fixed-runtime/manage-private-config.php",
         "Contents/Resources/fixed-runtime/legacy-manifest.json",
         "Contents/Resources/fixed-runtime/generation-b9fd468-manifest.json",
@@ -100,6 +104,7 @@ _LEGACY_BUNDLE_FILES_WITHOUT_PRIVATE_CONFIG_SSH_OR_EMAIL_ADDRESS = frozenset(
 )
 _EXISTING_DESTINATION_FILE_LAYOUTS = (
     frozenset(EXPECTED_BUNDLE_FILES),
+    _PRE_RECOVERY_BUNDLE_FILES,
     _PRE_GENERATION_ASSET_BUNDLE_FILES,
     _PRE_BOOTSTRAP_ASSET_BUNDLE_FILES,
     _LEGACY_BUNDLE_FILES_WITHOUT_EMAIL_ADDRESS,
@@ -120,6 +125,7 @@ _SOURCE_FILES = {
     "manager/scope_journal.py": "Contents/Resources/manager/scope_journal.py",
     "manager/private_config_ssh.py": "Contents/Resources/manager/private_config_ssh.py",
     "manager/email_address.py": "Contents/Resources/manager/email_address.py",
+    "manager/recovery.py": "Contents/Resources/manager/recovery.py",
 }
 _EXECUTABLE_BUNDLE_FILES = {
     "Contents/MacOS/applet",
@@ -411,7 +417,7 @@ def _validate_source_root(source_root: Path, uid: int) -> Path:
 
 
 def _fixed_runtime_bootstrap_assets(source_root: Path, uid: int) -> tuple[bytes, bytes, bytes]:
-    helper = _trusted_source_file(source_root, "bin/manage-private-config.php", uid)
+    helper = _trusted_source_file(source_root, "fixed-runtime/legacy-manage-private-config.php", uid)
     manifest = _trusted_source_file(source_root, "fixed-runtime/legacy-manifest.json", uid)
     generation_manifest = _trusted_source_file(
         source_root, "fixed-runtime/generation-b9fd468-manifest.json", uid)
