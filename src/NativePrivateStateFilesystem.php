@@ -12,6 +12,8 @@ final class NativePrivateStateFilesystem implements PrivateStateFilesystem
 {
     private readonly Closure $temporarySuffix;
     private readonly Closure $checkpoint;
+    private readonly Closure $monotonicClock;
+    private readonly Closure $lockSleeper;
     private readonly string $trustedHome;
     private readonly int $trustedUid;
     private bool $lockOperationActive = false;
@@ -32,6 +34,9 @@ final class NativePrivateStateFilesystem implements PrivateStateFilesystem
         ?callable $temporarySuffix = null,
         ?callable $checkpoint = null,
         ?callable $accountResolver = null,
+        ?callable $monotonicClock = null,
+        ?callable $lockSleeper = null,
+        private readonly float $lockWaitSeconds = 20.0,
     )
     {
         $this->temporarySuffix = Closure::fromCallable(
@@ -39,6 +44,15 @@ final class NativePrivateStateFilesystem implements PrivateStateFilesystem
         );
         $this->checkpoint = Closure::fromCallable(
             $checkpoint ?? static function (string $name): void {},
+        );
+        if (!is_finite($lockWaitSeconds) || $lockWaitSeconds < 0 || $lockWaitSeconds > 20) {
+            throw new RuntimeException('Private state unavailable');
+        }
+        $this->monotonicClock = Closure::fromCallable(
+            $monotonicClock ?? static fn (): float => hrtime(true) / 1000000000,
+        );
+        $this->lockSleeper = Closure::fromCallable(
+            $lockSleeper ?? static function (int $microseconds): void { usleep($microseconds); },
         );
         $accountResolver ??= static function (): array {
             if (!function_exists('posix_geteuid') || !function_exists('posix_getpwuid')) {
@@ -82,10 +96,32 @@ final class NativePrivateStateFilesystem implements PrivateStateFilesystem
     private function withExclusiveLockOnce(string $lockPath, callable $operation): mixed
     {
         $this->assertCanonicalFilePath($lockPath);
+        $deadline = $this->lockTime() + $this->lockWaitSeconds;
         [$directory, $directoryHandle, $directoryStat, $directoryChain] = $this->openDirectory(dirname($lockPath));
-        if (!flock($directoryHandle, LOCK_EX | LOCK_NB)) {
+        clearstatcache(true, $lockPath);
+        $initialLock = @lstat($lockPath);
+        $validateDirectory = function () use (
+            $directory, $directoryHandle, $directoryStat, $directoryChain, $lockPath, $initialLock,
+        ): void {
+            foreach ($directoryChain as $entry) { clearstatcache(true, $entry['path']); }
+            $this->assertChain($directoryChain);
+            $this->assertDirectory($directory, $directoryHandle, $directoryStat);
+            clearstatcache(true, $lockPath);
+            if (is_array($initialLock)) {
+                $current = @lstat($lockPath);
+                if (!is_array($current) || !$this->sameIdentity($initialLock, $current)) {
+                    throw new RuntimeException('Private state unavailable');
+                }
+            }
+        };
+        try {
+            $this->acquireLock($directoryHandle, $deadline, $validateDirectory);
+            // Never open a sidecar through a chain replaced during the bounded wait.
+            $validateDirectory();
+        } catch (Throwable $error) {
+            @flock($directoryHandle, LOCK_UN);
             $this->closeChain($directoryChain);
-            throw new RuntimeException('Private state unavailable');
+            throw $error;
         }
         $existing = @lstat($lockPath);
         if (is_array($existing)) {
@@ -109,9 +145,10 @@ final class NativePrivateStateFilesystem implements PrivateStateFilesystem
         try {
             $this->assertFile($lockPath, $lock);
             $this->assertDirectory($directory, $directoryHandle, $directoryStat);
-            if (!flock($lock, LOCK_EX)) {
-                throw new RuntimeException('Private state unavailable');
-            }
+            $this->acquireLock($lock, $deadline, function () use ($validateDirectory, $lockPath, $lock): void {
+                $validateDirectory();
+                $this->assertFile($lockPath, $lock);
+            });
             $this->assertFile($lockPath, $lock);
             $this->assertDirectory($directory, $directoryHandle, $directoryStat);
             $lockStat = fstat($lock);
@@ -144,6 +181,40 @@ final class NativePrivateStateFilesystem implements PrivateStateFilesystem
             @flock($directoryHandle, LOCK_UN);
             $this->closeChain($directoryChain);
         }
+    }
+
+    /** @param resource $handle */
+    private function acquireLock($handle, float $deadline, callable $validate): void
+    {
+        $lastTime = $this->lockTime();
+        $firstAttempt = true;
+        while (true) {
+            $now = $this->lockTime();
+            if ($now < $lastTime || (!$firstAttempt && $now >= $deadline)) {
+                throw new RuntimeException('Private state unavailable');
+            }
+            $lastTime = $now;
+            $firstAttempt = false;
+            $validate();
+            $wouldBlock = 0;
+            if (flock($handle, LOCK_EX | LOCK_NB, $wouldBlock)) {
+                $validate();
+                return;
+            }
+            if ($wouldBlock !== 1 || $now >= $deadline) {
+                throw new RuntimeException('Private state unavailable');
+            }
+            ($this->lockSleeper)((int) max(1, min(50000, ceil(($deadline - $now) * 1000000))));
+        }
+    }
+
+    private function lockTime(): float
+    {
+        $time = ($this->monotonicClock)();
+        if ((!is_float($time) && !is_int($time)) || !is_finite((float) $time) || $time < 0) {
+            throw new RuntimeException('Private state unavailable');
+        }
+        return (float) $time;
     }
 
     public function assertExclusiveLockCurrent(): void

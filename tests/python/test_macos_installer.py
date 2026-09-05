@@ -363,7 +363,7 @@ with patch('macos.install_app.Path.home', return_value=home):
         self.assertEqual((source / "manager/private_config_ssh.py").read_bytes(), bundled_helper.read_bytes())
         self.assertEqual(0o600, stat.S_IMODE(bundled_helper.stat().st_mode))
         fixed = bundle / "Contents/Resources/fixed-runtime"
-        self.assertEqual((source / "bin/manage-private-config.php").read_bytes(),
+        self.assertEqual((source / "fixed-runtime/legacy-manage-private-config.php").read_bytes(),
                          (fixed / "manage-private-config.php").read_bytes())
         self.assertEqual((source / "fixed-runtime/legacy-manifest.json").read_bytes(),
                          (fixed / "legacy-manifest.json").read_bytes())
@@ -711,6 +711,7 @@ with patch('macos.install_app.Path.home', return_value=home):
         destination = applications / "Xserverメール通知管理.app"
         shutil.copytree(bundle, destination)
         (destination / "Contents/Resources/manager/private_config_ssh.py").unlink()
+        (destination / "Contents/Resources/manager/recovery.py").unlink()
         shutil.rmtree(destination / "Contents/Resources/fixed-runtime")
 
         with patch("macos.install_app.Path.home", return_value=self.home), \
@@ -1134,9 +1135,11 @@ with patch('macos.install_app.Path.home', return_value=home):
             "manager/scope_journal.py",
             "manager/private_config_ssh.py",
             "manager/email_address.py",
+            "manager/recovery.py",
             "bin/manage-private-config.php", "bin/stable-mail-entrypoint.php",
             "bin/mail-forward-command-701.php", "bin/validate-release.php",
             "fixed-runtime/legacy-manifest.json",
+            "fixed-runtime/legacy-manage-private-config.php",
             "fixed-runtime/generation-b9fd468-manifest.json",
             "src/ReleaseValidator.php", "vendor/autoload.php",
             "vendor/php-di/php-di/src/Compiler/Template.php",

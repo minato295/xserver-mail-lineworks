@@ -176,7 +176,7 @@ file_put_contents($target, $frameTargetBody); chmod($target, 0700);
 file_put_contents($manifest, $frameManifestBody); chmod($manifest, 0600);
 file_put_contents($locatorPath, json_encode($locator, JSON_THROW_ON_ERROR)); chmod($locatorPath, 0600);
 
-foreach (['--check-config', '--check-message'] as $allowedArg) {
+foreach (['--check-config', '--check-message', '--outbox-list'] as $allowedArg) {
     @unlink($capture);
     $allowedPipes = [];
     $allowed = proc_open($command . ' ' . escapeshellarg($allowedArg), [['pipe', 'r'], ['pipe', 'w'], ['pipe', 'w']], $allowedPipes, null, array_replace($testEnvironment, [
@@ -193,7 +193,12 @@ foreach (['--check-config', '--check-message'] as $allowedArg) {
     ok($allowedCapture['argv'] === [$target, $allowedArg], "bootstrap did not pass {$allowedArg} exactly");
 }
 
-foreach ([['--unknown'], ['--check-config', '--check-message'], ['--check-config', '--check-config']] as $rejectedArgs) {
+$retryArgs = ['--outbox-retry', str_repeat('a', 64), str_repeat('b', 64)];
+exec($command . ' ' . implode(' ', array_map('escapeshellarg', $retryArgs)) . ' </dev/null >/dev/null 2>&1', $ignored, $retryCode);
+ok($retryCode === 0, 'bootstrap must admit one validated selected retry');
+foreach ([['--unknown'], ['--check-config', '--check-message'], ['--check-config', '--check-config'],
+    ['--outbox-list','extra'], ['--outbox-retry'], ['--outbox-retry',str_repeat('A',64),str_repeat('b',64)],
+    ['--outbox-retry',str_repeat('a',64),str_repeat('b',64),'extra']] as $rejectedArgs) {
     $rejectedCommand = $command;
     foreach ($rejectedArgs as $arg) $rejectedCommand .= ' ' . escapeshellarg($arg);
     exec($rejectedCommand . ' </dev/null >/dev/null 2>&1', $ignored, $code);

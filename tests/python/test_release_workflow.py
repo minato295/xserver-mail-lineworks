@@ -208,7 +208,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
         assets.mkdir()
         helper = assets / "manage-private-config.php"
         manifest = assets / "legacy-manifest.json"
-        shutil.copyfile(repository / "bin/manage-private-config.php", helper)
+        shutil.copyfile(repository / "fixed-runtime/legacy-manage-private-config.php", helper)
         shutil.copyfile(repository / "fixed-runtime/legacy-manifest.json", manifest)
         helper.chmod(0o644)
         manifest.chmod(0o644)
@@ -216,7 +216,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
 
     def test_pinned_legacy_asset_constants_match_tracked_assets(self):
         repository = Path(__file__).resolve().parents[2]
-        helper = (repository / "bin/manage-private-config.php").read_bytes()
+        helper = (repository / "fixed-runtime/legacy-manage-private-config.php").read_bytes()
         manifest = (repository / "fixed-runtime/legacy-manifest.json").read_bytes()
         self.assertEqual(ReleaseWorkflow.LEGACY_HELPER_SIZE, len(helper))
         self.assertEqual(ReleaseWorkflow.LEGACY_HELPER_SHA256,
@@ -276,6 +276,47 @@ class ReleaseWorkflowTest(unittest.TestCase):
         backup_root = "/private/.fixed-backup-" + self.workflow.CURRENT_GENERATION_MANIFEST_SHA256[:32]
         self.assertEqual(old_helper, self.deployer.ftps.files[backup_root + "/bootstrap/manage-private-config.php"])
 
+    def test_reliability_upgrade_migrates_only_pinned_helper_and_bootstrap(self):
+        self.workflow.provision_fixed_runtime(self.source)
+        root = "/home/example/private/xserver-mail-lineworks"
+        baseline = next(entries for name, entries, _ in self.deployer.remote_validator.inspections
+                        if name == root)
+        helper = baseline["bootstrap/manage-private-config.php"]
+        self.workflow.LEGACY_HELPER_SIZE = helper["size"]
+        self.workflow.LEGACY_HELPER_SHA256 = helper["sha256"]
+        body = (json.dumps({"schema_version": 1, "entries": baseline},
+                           sort_keys=True, separators=(",", ":")) + "\n").encode()
+        asset = Path(self.temp.name) / "reviewed-generation.json"
+        asset.write_bytes(body)
+        asset.chmod(0o644)
+        self.workflow.CURRENT_GENERATION_MANIFEST_PATH = asset
+        self.workflow.CURRENT_GENERATION_MANIFEST_MODE = 0o644
+        self.workflow.CURRENT_GENERATION_MANIFEST_SIZE = len(body)
+        self.workflow.CURRENT_GENERATION_MANIFEST_SHA256 = hashlib.sha256(body).hexdigest()
+        for file in ("manage-private-config.php", "stable-mail-entrypoint.php"):
+            (self.source / "bin" / file).write_text("<?php /* reviewed upgrade */\n")
+        helper_remote = self.workflow.PRIVATE_ROOT + "/bootstrap/manage-private-config.php"
+        def stop_after_first_replace(remote):
+            if remote == helper_remote:
+                raise SystemExit("simulated interruption")
+        self.deployer.ftps.after_replace = stop_after_first_replace
+        with self.assertRaises(SystemExit):
+            self.workflow.provision_fixed_runtime(self.source)
+        self.deployer.ftps.after_replace = None
+        self.workflow.provision_fixed_runtime(self.source)
+        for remote in ("manage-private-config.php", "mail-forward-command.php"):
+            self.assertEqual(b"<?php /* reviewed upgrade */\n", self.deployer.ftps.files[
+                self.workflow.PRIVATE_ROOT + "/bootstrap/" + remote])
+        # A repeat is an exact no-op, not another migration or backup rewrite.
+        replacements = len(self.deployer.ftps.events)
+        self.workflow.provision_fixed_runtime(self.source)
+        self.assertEqual(replacements, len(self.deployer.ftps.events))
+        (self.source / "src/ReleaseValidator.php").write_text("<?php /* unapproved */\n")
+        with self.assertRaises(ReleaseWorkflowError):
+            self.workflow.provision_fixed_runtime(self.source)
+        self.assertEqual(replacements, len(self.deployer.ftps.events))
+
+
     def test_template_filtering_does_not_change_immutable_release_validator(self):
         validator = Path(__file__).resolve().parents[2] / "src/ReleaseValidator.php"
         self.assertEqual(
@@ -322,7 +363,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
 
     def _seed_legacy_fixed_runtime(self, *, prefix=0, helper_family="new"):
         repository = Path(__file__).resolve().parents[2]
-        shutil.copyfile(repository / "bin/manage-private-config.php",
+        shutil.copyfile(repository / "fixed-runtime/legacy-manage-private-config.php",
                         self.source / "bin/manage-private-config.php")
         (self.source / "bin/manage-private-config.php").chmod(0o700)
         self.workflow.provision_fixed_runtime(self.source)

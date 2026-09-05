@@ -8,7 +8,7 @@ LINE WORKS Incoming WebhookがHTTP 500などを返した際に、メール本文
 
 既存の運用ログを使用する。
 
-`/home/s3710/mail-lineworks/private/log/mail-notifier.jsonl`
+`/home/example/mail-lineworks/private/log/mail-notifier.jsonl`
 
 - `public_html`配下へは保存しない。
 - ログファイルは所有者のみ読み書き可能な`0600`とする。

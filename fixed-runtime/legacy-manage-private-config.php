@@ -1384,29 +1384,7 @@ function healthSummary(array $config, string $home): array
     $classification = $status === 'healthy' ? 'success' : ($health['classification'] ?? null);
     $next = $health['next_observation_sequence'] ?? null;
     $applied = $health['last_applied_sequence'] ?? null;
-    $version = $health['schema_version'] ?? null;
-    $pending = null;
-    if ($version === 2 && isset($health['pending_alert_type'])) {
-        array_push($expectedKeys, 'pending_alert_type', 'pending_alert_changed_at',
-            'pending_alert_failure_at', 'pending_alert_classification');
-        sort($expectedKeys, SORT_STRING);
-        $pending = $health['pending_alert_type'];
-        if ($pending !== ($status === 'degraded' ? 'error' : 'recovery')
-            || ($health['pending_alert_changed_at'] ?? null) !== $changedAt
-            || !is_string($health['pending_alert_failure_at'] ?? null)
-            || !in_array($health['pending_alert_classification'] ?? null,
-                array_diff($classifications, ['success']), true)) {
-            throw new RuntimeException();
-        }
-        $failureAt = DateTimeImmutable::createFromFormat('!Y-m-d\TH:i:s\Z',
-            $health['pending_alert_failure_at'], new DateTimeZone('UTC'));
-        if (!$failureAt instanceof DateTimeImmutable
-            || $failureAt->format('Y-m-d\TH:i:s\Z') !== $health['pending_alert_failure_at']
-            || $health['pending_alert_failure_at'] > $changedAt) {
-            throw new RuntimeException();
-        }
-    }
-    if ($keys !== $expectedKeys || !in_array($version, [1, 2], true)
+    if ($keys !== $expectedKeys || ($health['schema_version'] ?? null) !== 1
         || !in_array($status, ['healthy', 'degraded'], true)
         || !is_string($changedAt)
         || preg_match('/\A[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z\z/D', $changedAt) !== 1
@@ -1422,13 +1400,9 @@ function healthSummary(array $config, string $home): array
     if (!$parsed instanceof DateTimeImmutable || $parsed->format('Y-m-d\TH:i:s\Z') !== $changedAt) {
         throw new RuntimeException();
     }
-    $summary = ['schema_version' => $version, 'state' => $status, 'changed_at' => $changedAt,
+    return ['schema_version' => 1, 'state' => $status, 'changed_at' => $changedAt,
         'classification' => $classification, 'next_observation_sequence' => $next,
         'last_applied_sequence' => $applied];
-    if ($version === 2) {
-        $summary['pending_alert'] = $pending;
-    }
-    return $summary;
 }
 
 try {

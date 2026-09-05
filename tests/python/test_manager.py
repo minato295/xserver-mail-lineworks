@@ -1601,7 +1601,7 @@ class ManagerTest(unittest.TestCase):
                           fixed / "legacy-manifest.json", 0o600),
                          _legacy_bootstrap_asset_paths(bundle_manager))
         repository = Path(__file__).resolve().parents[2]
-        self.assertEqual((repository / "bin/manage-private-config.php",
+        self.assertEqual((repository / "fixed-runtime/legacy-manage-private-config.php",
                           repository / "fixed-runtime/legacy-manifest.json", 0o644),
                          _legacy_bootstrap_asset_paths(repository / "manager/manage.py"))
 
@@ -2070,6 +2070,42 @@ class ManagerTest(unittest.TestCase):
                 rendered = "\n".join(output)
                 self.assertIn(expected, rendered)
                 self.assertNotIn(secret, rendered)
+
+    def test_diagnostics_accept_length_fallback_and_compatibility_producer_paths(self):
+        for statuses in ([400, 200, 200], [500, 400, 200], [429, 400, 200],
+                         [500, 500, 400, 200, 200]):
+            with self.subTest(statuses=statuses):
+                event = webhook_diagnostic_event(
+                    outcome="success", classification="success", http_status=200,
+                    attempt_count=len(statuses), attempt_http_statuses=statuses,
+                    provider_code=400,
+                    provider_description="limit exceeded (body.text length exceeds 2000)",
+                    recovered_by_retry=False,
+                )
+                MailManager._validated_webhook_log_event(event)
+
+    def test_diagnostics_accept_historical_length_failure_without_hiding_new_entries(self):
+        event = webhook_diagnostic_event(outcome="failure", classification="http_error",
+            http_status=400, attempt_count=1, attempt_http_statuses=[400],
+            provider_code=400, provider_description="limit exceeded (body.text length exceeds 2000)",
+            recovered_by_retry=False)
+        self.assertTrue(MailManager._validated_webhook_log_event(event)[1])
+        event["classification"] = "invalid_parameter"
+        self.assertTrue(MailManager._validated_webhook_log_event(event)[1])
+
+    def test_diagnostics_accept_safe_private_exception_event(self):
+        event = {
+            "timestamp": "2026-07-13T00:00:00+00:00", "outcome": "failure",
+            "message_id_hash": "a" * 64, "classification": "internal_error",
+            "http_status": None, "stage": "parse", "exception_type": "RuntimeException",
+            "source_file": "src/DeliveryApplication.php", "source_line": 51,
+        }
+        self.assertFalse(MailManager._validated_webhook_log_event(event)[1])
+        for extra in ({"exception_type": "PRIVATE_SECRET"},
+                      {"source_file": "/home/example/private/secret.php"},
+                      {"source_line": True}, {"message": "SECRET"}):
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                MailManager._validated_webhook_log_event({**event, **extra})
 
     def test_diagnostics_accept_producer_correlated_response_metadata(self):
         log_path = "/home/example/mail-lineworks/private/log/mail-notifier.jsonl"
@@ -3232,7 +3268,7 @@ class ManagerTest(unittest.TestCase):
             self.assertEqual(0, main())
         helper_path, manifest_path, mode = _legacy_bootstrap_asset_paths()
         repository = Path(__file__).resolve().parents[2]
-        self.assertEqual((repository / "bin/manage-private-config.php",
+        self.assertEqual((repository / "fixed-runtime/legacy-manage-private-config.php",
                           repository / "fixed-runtime/legacy-manifest.json", 0o644),
                          (helper_path, manifest_path, mode))
         self.assertEqual([], ftps.replacements)

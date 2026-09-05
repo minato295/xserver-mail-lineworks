@@ -314,6 +314,12 @@ class ReleaseWorkflow:
     def _migrate_fixed_runtime(self, new_entries: dict, target_expected: dict,
                                *, expected_hosts: list[str]) -> None:
         """Advance only the pinned legacy tree through the three reviewed prefixes."""
+        target_helper = new_entries.get("bootstrap/manage-private-config.php", {})
+        if (target_helper.get("size") != self.LEGACY_HELPER_SIZE
+                or target_helper.get("sha256") != self.LEGACY_HELPER_SHA256):
+            self._migrate_reliability_runtime(new_entries, target_expected,
+                                              expected_hosts=expected_hosts)
+            return
         manifest_body = self._read_pinned_asset(
             Path(self.LEGACY_MANIFEST_PATH), expected_mode=self.LEGACY_MANIFEST_MODE,
             expected_size=self.LEGACY_MANIFEST_SIZE,
@@ -402,9 +408,47 @@ class ReleaseWorkflow:
                 target_expected=target_expected, expected_hosts=expected_hosts,
             )
 
+    def _migrate_reliability_runtime(self, target_entries, target_expected,
+                                     *, expected_hosts):
+        """Upgrade the independently pinned pre-recovery release, never remote-derived trust."""
+        body = self._read_pinned_asset(
+            Path(self.CURRENT_GENERATION_MANIFEST_PATH),
+            expected_mode=self.CURRENT_GENERATION_MANIFEST_MODE,
+            expected_size=self.CURRENT_GENERATION_MANIFEST_SIZE,
+            expected_sha256=self.CURRENT_GENERATION_MANIFEST_SHA256,
+        )
+        baseline = self._validate_fixed_manifest(body)
+        helper = "bootstrap/manage-private-config.php"
+        if helper not in baseline:
+            raise ReleaseWorkflowError("固定runtimeの旧世代を確認できません。")
+        # ee6ce36 differs from the pinned b9fd468 generation only in this helper.
+        baseline[helper] = {"type": "file", "mode": 0o700,
+                            "size": self.LEGACY_HELPER_SIZE,
+                            "sha256": self.LEGACY_HELPER_SHA256}
+        allowed = (helper, "bootstrap/mail-forward-command.php")
+        if set(baseline) != set(target_entries):
+            raise ReleaseWorkflowError("固定runtimeの構成が異なります。")
+        for path in set(baseline) - set(allowed):
+            if baseline[path] != target_entries[path]:
+                raise ReleaseWorkflowError("許可されていない固定runtime変更です。")
+        order = tuple(path for path in allowed if baseline[path] != target_entries[path])
+        if not order:
+            raise ReleaseWorkflowError("固定runtime移行差分がありません。")
+        for path in order:
+            if (target_entries[path].get("type") != "file"
+                    or target_entries[path].get("mode") != 0o700):
+                raise ReleaseWorkflowError("固定runtime移行先の権限が不正です。")
+        generation = hashlib.sha256(json.dumps(
+            {"baseline": baseline, "order": order}, sort_keys=True,
+            separators=(",", ":")).encode()).hexdigest()[:32]
+        self._migrate_fixed_generation(baseline, target_entries, order,
+            target_expected=target_expected, expected_hosts=expected_hosts,
+            generation=generation)
+
     def _migrate_fixed_generation(self, current_manifest: dict, target_entries: dict,
                                   migration_order=("bootstrap/manage-private-config.php",),
-                                  *, target_expected: dict, expected_hosts: list[str]) -> None:
+                                  *, target_expected: dict, expected_hosts: list[str],
+                                  generation: str | None = None) -> None:
         """Atomically advance one independently pinned fixed-runtime generation."""
         if (type(current_manifest) is not dict or type(target_entries) is not dict
                 or type(migration_order) is not tuple or not migration_order
@@ -443,7 +487,7 @@ class ReleaseWorkflow:
             return
         self._run_fixed_migration_transaction(
             prefixes, prefix, migration_order,
-            generation=self.CURRENT_GENERATION_MANIFEST_SHA256[:32],
+            generation=generation or self.CURRENT_GENERATION_MANIFEST_SHA256[:32],
             target_expected=target_expected, expected_hosts=expected_hosts,
             label="generation",
         )

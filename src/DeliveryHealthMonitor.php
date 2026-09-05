@@ -120,6 +120,7 @@ final class DeliveryHealthMonitor
                 if (!$transition) {
                     $state['last_applied_sequence'] = $sequence;
                     $this->writeState($state);
+                    $this->sendPendingAlert($state);
                     return;
                 }
 
@@ -140,15 +141,6 @@ final class DeliveryHealthMonitor
                         throw new RuntimeException('Invalid health state');
                     }
                 }
-                try {
-                    $this->filesystem->assertExclusiveLockCurrent();
-                    $this->sendTransition($mailType, $now, $failureAt, $mailClassification);
-                } catch (Throwable) {
-                    $state['last_applied_sequence'] = $sequence;
-                    $this->writeState($state);
-                    return;
-                }
-
                 $state['status'] = $success ? 'healthy' : 'degraded';
                 $state['changed_at'] = $now->format('Y-m-d\TH:i:s\Z');
                 $state['last_applied_sequence'] = $sequence;
@@ -158,11 +150,46 @@ final class DeliveryHealthMonitor
                     $state['classification'] = $classification;
                     $state['message_id_hash'] = $hash;
                 }
+                // Persist delivery truth before attempting a separate alert transport.
+                // A newer transition supersedes any undelivered, now-stale alert.
+                $state['pending_alert_type'] = $mailType;
+                $state['pending_alert_changed_at'] = $now->format('Y-m-d\TH:i:s\Z');
+                $state['pending_alert_failure_at'] = $failureAt->format('Y-m-d\TH:i:s\Z');
+                $state['pending_alert_classification'] = $mailClassification;
                 $this->writeState($state);
+                $this->sendPendingAlert($state);
             });
         } catch (Throwable) {
             $this->logStateFailure();
         }
+    }
+
+    /** @param array<string,mixed> $state */
+    private function sendPendingAlert(array $state): void
+    {
+        if (!isset($state['pending_alert_type'])) {
+            return;
+        }
+        try {
+            $this->filesystem->assertExclusiveLockCurrent();
+            $this->sendTransition(
+                $state['pending_alert_type'],
+                new DateTimeImmutable($state['pending_alert_changed_at']),
+                new DateTimeImmutable($state['pending_alert_failure_at']),
+                $state['pending_alert_classification'],
+            );
+        } catch (Throwable $error) {
+            try {
+                $this->logger->logException($error, hash('sha256', 'health-alert'), 'alert_mail');
+            } catch (Throwable) {
+            }
+            return;
+        }
+        foreach (['type', 'changed_at', 'failure_at', 'classification'] as $field) {
+            unset($state['pending_alert_' . $field]);
+        }
+        // A crash after sendmail acceptance can cause a duplicate alert on retry.
+        $this->writeState($state);
     }
 
     private function sendTransition(
@@ -198,7 +225,7 @@ final class DeliveryHealthMonitor
         $bytes = $this->filesystem->readRegular($this->statePath, self::MAX_STATE_BYTES);
         if ($bytes === null) {
             $state = [
-                'schema_version' => 1,
+                'schema_version' => 2,
                 'status' => 'healthy',
                 'changed_at' => $this->now()->format('Y-m-d\TH:i:s\Z'),
                 'next_observation_sequence' => 0,
@@ -223,9 +250,23 @@ final class DeliveryHealthMonitor
             : ['schema_version', 'status', 'changed_at', 'next_observation_sequence',
                 'last_applied_sequence'];
         $actualKeys = array_keys($state);
+        $version = $state['schema_version'] ?? null;
+        if ($version === 2 && isset($state['pending_alert_type'])) {
+            array_push($expected, 'pending_alert_type', 'pending_alert_changed_at',
+                'pending_alert_failure_at', 'pending_alert_classification');
+            if ($state['pending_alert_type'] !== ($status === 'degraded' ? 'error' : 'recovery')
+                || !$this->validTimestamp($state['pending_alert_changed_at'] ?? null)
+                || !$this->validTimestamp($state['pending_alert_failure_at'] ?? null)
+                || $state['pending_alert_changed_at'] !== ($state['changed_at'] ?? null)
+                || $state['pending_alert_failure_at'] > $state['pending_alert_changed_at']
+                || !in_array($state['pending_alert_classification'] ?? null,
+                    array_diff(self::LEGACY_CLASSIFICATIONS, ['success']), true)) {
+                throw new RuntimeException('Invalid health state');
+            }
+        }
         sort($actualKeys, SORT_STRING);
         sort($expected, SORT_STRING);
-        if ($actualKeys !== $expected || ($state['schema_version'] ?? null) !== 1
+        if ($actualKeys !== $expected || !in_array($version, [1, 2], true)
             || !in_array($status, ['healthy', 'degraded'], true)
             || !$this->validTimestamp($state['changed_at'] ?? null)
             || !is_int($state['next_observation_sequence'] ?? null)
@@ -239,6 +280,7 @@ final class DeliveryHealthMonitor
                 || preg_match('/\A[a-f0-9]{64}\z/D', $state['message_id_hash'] ?? '') !== 1))) {
             throw new RuntimeException('Invalid health state');
         }
+        $state['schema_version'] = 2;
         return $state;
     }
 

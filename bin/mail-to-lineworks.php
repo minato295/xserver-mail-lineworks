@@ -19,7 +19,11 @@ if (getenv('MAIL_NOTIFIER_FD_RUNTIME') !== '1') {
 }
 
 $arguments = array_slice($argv, 1);
-if (!in_array($arguments, [[], ['--check-config'], ['--check-message']], true)) {
+$listMode = $arguments === ['--outbox-list'];
+$retryMode = count($arguments) === 3 && $arguments[0] === '--outbox-retry'
+    && preg_match('/\A[a-f0-9]{64}\z/D', $arguments[1]) === 1
+    && preg_match('/\A[a-f0-9]{64}\z/D', $arguments[2]) === 1;
+if (!$listMode && !$retryMode && !in_array($arguments, [[], ['--check-config'], ['--check-message']], true)) {
     exit(1);
 }
 $checkMode = $arguments === ['--check-config'];
@@ -38,6 +42,24 @@ try {
         $raw = $frame['message'];
     } else {
         $config = NotifierConfig::load(getenv('MAIL_NOTIFIER_CONFIG') ?: NotifierConfig::defaultPath(__DIR__));
+    }
+    if ($checkMode) {
+        exit(0);
+    }
+    if ($listMode) {
+        $outbox = new XserverMail\DeliveryOutbox(dirname($config->logPath) . '/delivery-outbox.json');
+        echo json_encode($outbox->listMetadata(), JSON_THROW_ON_ERROR) . "\n";
+        exit(0);
+    }
+    if ($messageCheckMode) {
+        if (!$framed) {
+            $raw = stream_get_contents(STDIN, 10 * 1024 * 1024 + 1);
+            if (!is_string($raw) || strlen($raw) > 10 * 1024 * 1024) {
+                throw new RuntimeException('Input unavailable');
+            }
+        }
+        (new XserverMail\MailParser())->parse($raw, new DateTimeImmutable('2000-01-01T00:00:00+09:00'));
+        exit(0);
     }
     $logger = new OperationalLogger($config->logPath);
     $authenticator = new SystemMailAuthenticator($config->systemMailHmacKey);
@@ -58,10 +80,25 @@ try {
     $reporter = new ErrorReporter(
         $webhook, $logger, $healthMonitor,
     );
-    $deduplicator = new DeliveryDeduplicator($config->dedupPath);
-    if ($checkMode) {
+    $outbox = null;
+    try {
+        $outbox = new XserverMail\DeliveryOutbox(dirname($config->logPath) . '/delivery-outbox.json');
+    } catch (Throwable) {
+        if ($retryMode) {
+            throw new RuntimeException('Private recovery unavailable');
+        }
+        try {
+            $logger->log('failure', hash('sha256', 'startup'), 'outbox_store_failure', null);
+        } catch (Throwable) {
+        }
+    }
+    if ($retryMode) {
+        $result = (new XserverMail\DeliveryRecovery($outbox, $config, $webhook, $logger, $healthMonitor))
+            ->retrySelected($arguments[1], $arguments[2]);
+        echo json_encode($result, JSON_THROW_ON_ERROR) . "\n";
         exit(0);
     }
+    $deduplicator = new DeliveryDeduplicator($config->dedupPath);
 
     if (!$framed) {
         $raw = '';
@@ -75,20 +112,22 @@ try {
         }
     }
 
-    if ($messageCheckMode) {
-        (new XserverMail\MailParser())->parse($raw, new DateTimeImmutable('2000-01-01T00:00:00+09:00'));
-        exit(0);
-    }
     (new DeliveryApplication(
         $webhook, $reporter, $logger, $config, $deduplicator,
-        $authenticator, $healthMonitor,
+        $authenticator, $healthMonitor, null, null, $outbox,
     ))->deliver($raw);
 } catch (Throwable $error) {
+    if ($listMode || $retryMode) {
+        fwrite(STDERR, "未送信通知の確認・再送を完了できませんでした。一覧で状態を再確認してください。\n");
+        exit(1);
+    }
     if (!isset($reporter)) {
         $exitCode = 1;
     } else {
         try {
-            $reporter->report($error, hash('sha256', 'startup'));
+            if (!$checkMode && !$messageCheckMode) {
+                $reporter->report($error, hash('sha256', 'startup'), false, 'startup');
+            }
         } catch (Throwable) {
             // Reporting must not block inbound mail delivery.
         }

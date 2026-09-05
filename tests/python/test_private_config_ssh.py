@@ -105,6 +105,17 @@ class PrivateConfigSshTest(unittest.TestCase):
         request = json.loads(trusted.calls[0][1]) if trusted.calls else None
         self.assertEqual({"schema_version": 1, "operation": "health-summary"}, request)
 
+    def test_health_summary_v2_exposes_pending_alert_independently(self):
+        client, trusted = self.make()
+        expected = {
+            "state": "healthy", "changed_at": "2026-07-13T00:00:00Z",
+            "classification": "success", "next_observation_sequence": 3,
+            "last_applied_sequence": 2, "pending_alert": "recovery",
+        }
+        trusted.run_trusted = lambda *args, **kwargs: json.dumps(
+            {"schema_version": 2, **expected}).encode()
+        self.assertEqual(expected, client.health_summary())
+
     def test_health_summary_rejects_inexact_or_unsafe_responses(self):
         valid = {
             "schema_version": 1, "state": "healthy",

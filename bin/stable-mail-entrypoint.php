@@ -207,8 +207,12 @@ try {
     $callerArgs = array_slice($argv, 1);
     if ($callerArgs === []) {
         $childArgs = [];
-    } elseif (count($callerArgs) === 1 && in_array($callerArgs[0], ['--check-config', '--check-message'], true)) {
+    } elseif (count($callerArgs) === 1 && in_array($callerArgs[0], ['--check-config', '--check-message', '--outbox-list'], true)) {
         $childArgs = [$callerArgs[0]];
+    } elseif (count($callerArgs) === 3 && $callerArgs[0] === '--outbox-retry'
+        && preg_match('/\A[a-f0-9]{64}\z/D', $callerArgs[1]) === 1
+        && preg_match('/\A[a-f0-9]{64}\z/D', $callerArgs[2]) === 1) {
+        $childArgs = $callerArgs;
     } else {
         bootstrapFail();
     }
