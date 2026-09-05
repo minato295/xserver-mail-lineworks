@@ -44,7 +44,9 @@ function bootstrapCopyLimited($source, $destination, int $limit): void
         bootstrapWriteAll($destination, $chunk);
         $copied += strlen($chunk);
     }
-    bootstrapFail();
+    // The limit includes one sentinel byte. The verified child reports size
+    // rejection with trusted configuration; never forward an unbounded input.
+    return;
 }
 
 /** @return array<string,mixed> */

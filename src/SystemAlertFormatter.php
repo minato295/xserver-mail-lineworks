@@ -12,6 +12,7 @@ final class SystemAlertFormatter
 {
     /** @var array<string,string> */
     private const CLASSIFICATION_DISPLAYS = [
+        'input_too_large' => '添付を含む受信メール全体が10MiBの上限を超えたため通知できませんでした。元のメールボックスで確認してください。',
         'transport_error' => 'LINE WORKSに接続できませんでした。',
         'http_error' => 'LINE WORKSからエラーが返されました。',
         'rate_limited' => 'LINE WORKSの送信回数制限に達しました。',

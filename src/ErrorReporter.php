@@ -22,7 +22,8 @@ final class ErrorReporter
         string $stage = 'delivery',
         ?int $sequence = null,
     ): void {
-        $classification = $forceWebhookFailure ? 'forced_test_failure' : 'internal_error';
+        $classification = $forceWebhookFailure ? 'forced_test_failure'
+            : ($error instanceof InputTooLarge ? 'input_too_large' : 'internal_error');
         $sequence ??= $this->healthMonitor?->reserveObservation();
         if ($sequence !== null) {
             $this->healthMonitor?->recordFailure($sequence, $classification, $messageIdHash);

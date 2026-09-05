@@ -42,6 +42,14 @@ class RecoverySsh:
             value[key] = item
         return value
 
+    def check_startup(self):
+        """Validate the current verified bootstrap/config without creating senders."""
+        output = self.validator.run_trusted(
+            self.remote_command + ' --check-config', b'',
+            expected_hosts=self.expected_hosts, output_limit=1024)
+        if type(output) is not bytes or output != b'':
+            raise RuntimeError('通知処理の起動確認に失敗しました。')
+
     def _call(self, arguments):
         # Every argument is either a fixed literal or prevalidated lowercase hex.
         output = self.validator.run_trusted(self.remote_command + ' ' + ' '.join(arguments), b'',

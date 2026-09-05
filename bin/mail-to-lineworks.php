@@ -33,7 +33,9 @@ $exitCode = 0;
 try {
     $framed = getenv('MAIL_NOTIFIER_STDIN_FRAME') === '1';
     if ($framed) {
-        $frame = XserverMail\StdinFrame::decode(STDIN);
+        // Preserve at most limit+1 bytes for the normal path so its initialized
+        // reporter can record an oversize failure. Check/list/retry stay strict.
+        $frame = XserverMail\StdinFrame::decode(STDIN, $arguments === []);
         $value = json_decode($frame['configJson'], true, 32, JSON_THROW_ON_ERROR);
         if (!is_array($value) || array_is_list($value)) {
             throw new InvalidArgumentException('Invalid configuration');

@@ -1376,7 +1376,7 @@ function healthSummary(array $config, string $home): array
             'next_observation_sequence', 'schema_version', 'status']
         : ['changed_at', 'last_applied_sequence', 'next_observation_sequence',
             'schema_version', 'status'];
-    $classifications = ['success', 'invalid_payload', 'invalid_parameter',
+    $classifications = ['success', 'invalid_payload', 'input_too_large', 'invalid_parameter',
         'missing_parameter', 'invalid_webhook_url', 'rate_limited', 'http_error',
         'transport_error', 'forced_test_failure', 'internal_error',
         'system_mail_suppressed', 'health_state_failure', 'unknown'];

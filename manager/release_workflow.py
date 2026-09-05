@@ -45,6 +45,19 @@ class ReleaseWorkflow:
     CURRENT_GENERATION_MANIFEST_PATH = (Path(__file__).resolve().parents[1]
                                         / "fixed-runtime/generation-b9fd468-manifest.json")
     CURRENT_GENERATION_MANIFEST_MODE = LEGACY_MANIFEST_MODE
+    # Independently pinned from merged ddd4596, not learned from the server.
+    RECOVERY_GENERATION_FILES = {
+        "bootstrap/manage-private-config.php": {
+            "type": "file", "mode": 0o700, "size": 70540,
+            "sha256": ("f30677827c2f44e1" + "94f2dd61bb8d1a64"
+                       + "6ad47495c34bc2d4" + "13a439fed6f284c1"),
+        },
+        "bootstrap/mail-forward-command.php": {
+            "type": "file", "mode": 0o700, "size": 15567,
+            "sha256": ("ef4391c9e0cf8281" + "19491453e407ccc3"
+                       + "6359392cb44c40cc" + "e4112ce8ee30e4fa"),
+        },
+    }
     FIXED_MIGRATION_ORDER = (
         "src/ReleaseValidator.php",
         "bootstrap/validate-release.php",
@@ -431,6 +444,27 @@ class ReleaseWorkflow:
         for path in set(baseline) - set(allowed):
             if baseline[path] != target_entries[path]:
                 raise ReleaseWorkflowError("許可されていない固定runtime変更です。")
+        # Select one known predecessor (or its interrupted migration prefix).
+        # Never manufacture a trusted baseline from current remote contents.
+        recovery = {path: dict(item) for path, item in baseline.items()}
+        recovery.update({path: dict(item) for path, item in self.RECOVERY_GENERATION_FILES.items()})
+        matches = []
+        for candidate in (baseline, recovery):
+            cursor = {path: dict(item) for path, item in candidate.items()}
+            candidate_order = tuple(path for path in allowed if cursor[path] != target_entries[path])
+            for path in candidate_order:
+                try:
+                    exact = self.deployer.remote_validator.inspect_fixed_runtime(
+                        self.filesystem_home + self.PRIVATE_ROOT, cursor,
+                        expected_hosts=expected_hosts) == "EXACT"
+                except RemoteValidationError:
+                    exact = False
+                if exact:
+                    matches.append(candidate)
+                cursor[path] = dict(target_entries[path])
+        if len(matches) != 1:
+            raise ReleaseWorkflowError("固定runtimeの既知世代を一意に確認できません。")
+        baseline = matches[0]
         order = tuple(path for path in allowed if baseline[path] != target_entries[path])
         if not order:
             raise ReleaseWorkflowError("固定runtime移行差分がありません。")

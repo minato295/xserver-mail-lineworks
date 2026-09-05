@@ -7,6 +7,20 @@ from unittest.mock import patch
 
 
 class RecoveryTest(unittest.TestCase):
+    def test_startup_check_is_fixed_read_only_command_and_rejects_output(self):
+        from manager.recovery import RecoverySsh
+        with patch('manager.remote_validator.RemoteValidator') as validator:
+            client = RecoverySsh('safe-alias', '/home/example', expected_hosts=['host.example.invalid'])
+        remote = validator.return_value
+        remote.run_trusted.return_value = b''
+        self.assertIsNone(client.check_startup())
+        remote.run_trusted.assert_called_once_with(
+            '/usr/bin/php8.5 /home/example/private/xserver-mail-lineworks/bootstrap/mail-forward-command.php --check-config',
+            b'', expected_hosts=['host.example.invalid'], output_limit=1024)
+        remote.run_trusted.return_value = b'unexpected'
+        with self.assertRaises(RuntimeError):
+            client.check_startup()
+
     def test_cold_recovery_import_during_mocked_config_bootstrap_does_not_poison_client(self):
         # Reproduce the discovery-order failure in a fresh interpreter. Only the
         # private-config client is mocked during first import; recovery must still

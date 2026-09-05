@@ -43,6 +43,7 @@ php -d assert.exception=1 tests/php/test_dedup_capacity.php
 php -d assert.exception=1 tests/php/test_private_state_lock_wait.php
 php -d assert.exception=1 tests/php/test_outbox.php
 php -d assert.exception=1 tests/php/test_recovery.php
+php -d assert.exception=1 tests/php/test_startup_and_recovery_failure.php
 php -d assert.exception=1 tests/php/test_outbox_cli.php
 php -d assert.exception=1 tests/php/test_stable_bootstrap.php
 php -d assert.exception=1 tests/php/test_release_validator.php

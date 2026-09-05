@@ -71,6 +71,7 @@ if (is_string($capture) && $capture !== '') {
         'argv' => $argv,
         'config_ok' => hash_equals(hash('sha256', '{"value":"verified"}'), hash('sha256', $configBytes)),
         'input_ok' => hash_equals(hash('sha256', "From: test@example.invalid\n\nbody"), hash('sha256', $input)),
+        'input_bytes' => strlen($input),
         'frame_env' => getenv('MAIL_NOTIFIER_STDIN_FRAME'),
         'dependency' => RaceFixture\Dependency::value(),
         'entry_file' => __FILE__,
@@ -206,6 +207,7 @@ foreach ([['--unknown'], ['--check-config', '--check-message'], ['--check-config
 }
 
 $oversizePipes = [];
+@unlink($capture);
 $oversize = proc_open($command, [['pipe', 'r'], ['pipe', 'w'], ['pipe', 'w']], $oversizePipes, null, array_replace($testEnvironment, ['BOOTSTRAP_CAPTURE' => $capture]));
 ok(is_resource($oversize), 'oversize bootstrap process could not start');
 $remaining = 10485761;
@@ -218,7 +220,9 @@ while ($remaining > 0) {
 fclose($oversizePipes[0]);
 stream_get_contents($oversizePipes[1]); fclose($oversizePipes[1]);
 $oversizeStderr = stream_get_contents($oversizePipes[2]); fclose($oversizePipes[2]);
-ok(proc_close($oversize) !== 0, 'bootstrap accepted a 10 MiB + 1 message');
+ok(proc_close($oversize) === 0, 'bootstrap must delegate bounded oversize evidence to verified reporter');
+$oversizeCapture = json_decode((string) file_get_contents($capture), true);
+ok($oversizeCapture['input_bytes'] === 10485761 && $oversizeCapture['config_ok'], 'oversize sentinel and verified configuration must reach child exactly');
 ok(!str_contains($oversizeStderr, '{"value":"verified"}') && !str_contains($oversizeStderr, '/secret/legacy/config'), 'bootstrap exposed configuration in an error');
 
 $validManifestBody = file_get_contents($manifest);

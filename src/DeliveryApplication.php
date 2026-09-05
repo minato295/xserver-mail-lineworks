@@ -53,7 +53,7 @@ final class DeliveryApplication
         $sequence = null;
         try {
             if (strlen($raw) > 10 * 1024 * 1024) {
-                throw new RuntimeException('Input exceeds limit');
+                throw new InputTooLarge('Input exceeds limit');
             }
             $stage = 'clock';
             $now = ($this->utcClock)();

@@ -1115,6 +1115,13 @@ class MailManager:
                 health += "（%sメール送信保留）" % ("障害通知" if pending == "error" else "復旧通知")
         except Exception:
             health = "状態ファイル不正"
+        startup = "未確認"
+        if self.recovery_client is not None:
+            try:
+                self.recovery_client.check_startup()
+                startup = "成功（確認時点・送信なし）"
+            except Exception:
+                startup = "失敗（通知処理の起動設定を確認してください）"
         release_configured = any(
             type(config.get(key)) is str and bool(config[key])
             for key in ("release_path", "release_id")
@@ -1130,6 +1137,7 @@ class MailManager:
                 len(api_targets), len(configured_targets),
             ),
             "health": health,
+            "startup": startup,
             "latest_log": "リモートリリース: %s" % (
                 "設定済み" if release_configured else "不明"
             ),
@@ -1155,7 +1163,7 @@ class MailManager:
         outcome = event["outcome"]
         classification = event["classification"]
         classifications = {
-            "success", "invalid_payload", "invalid_parameter", "missing_parameter",
+            "success", "invalid_payload", "input_too_large", "invalid_parameter", "missing_parameter",
             "invalid_webhook_url", "rate_limited", "http_error", "transport_error",
             "forced_test_failure", "internal_error", "system_mail_suppressed",
             "health_state_failure", "unknown", "dedup_store_failure", "outbox_store_failure",
@@ -1552,7 +1560,9 @@ class MailManager:
         self.output("同期状態: " + str(result.get("sync", "不明")))
         self.output("恒久対象: " + str(result.get("pinned", "不明")))
         self.output("通知対象: " + str(result.get("targets", "不明")))
-        self.output("配信状態: " + str(result.get("health", "不明")))
+        self.output("起動確認: " + str(result.get("startup", "未確認")))
+        self.output("最終記録の配信状態: " + str(result.get("health", "不明")))
+        self.output("※最終記録の正常表示は現在の送達を保証しません。起動確認も実際の送信試験ではありません。")
         self.output("最新ログ: " + str(result.get("latest_log", "なし")))
         self.output("Webhook診断: " + str(result.get(
             "webhook_diagnostic", "詳細診断情報なし"
