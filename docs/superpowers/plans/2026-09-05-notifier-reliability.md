@@ -43,5 +43,5 @@ Files: README.md, affected docs, tests/run-all.sh or extracted public scanner wi
 
 - [x] Replace actual environment paths with /home/example/... in tracked documentation.
 - [x] Add scanner regression for private account paths; legitimate example.invalid remains allowed.
-- [ ] Run complete offline suite and public scan. Independent review and address substantive findings.
+- [x] Run complete offline suite and public scan. Independent review and address substantive findings. PHP suites and Python482 tests (one environment skip) passed; public scan passed; no real test notifications.
 - [ ] Publish through reviewed PR and deploy using existing verified workflow; verify release readback without notification tests.
