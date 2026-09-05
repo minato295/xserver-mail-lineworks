@@ -9,80 +9,29 @@ use Throwable;
 final class ErrorReporter
 {
     public function __construct(
-        private readonly WebhookClient $webhook,
+        WebhookClient $webhook, // Backwards-compatible argument; reporting never uses LINE WORKS.
         private readonly OperationalLogger $logger,
         private readonly ?DeliveryHealthMonitor $healthMonitor = null,
     ) {
     }
 
-    public function report(Throwable $error, string $messageIdHash, bool $forceWebhookFailure = false): void
-    {
-        $classification = self::classify($error);
-        if ($this->healthMonitor !== null) {
-            if ($forceWebhookFailure) {
-                $sequence = $this->healthMonitor->reserveSyntheticFailure();
-                if ($sequence !== null) {
-                    $this->healthMonitor->recordFailure(
-                        $sequence, 'forced_test_failure', $messageIdHash,
-                    );
-                }
-                $this->safeLog('failure', $messageIdHash, 'forced_test_failure', null);
-                return;
-            }
-            $observed = $this->webhook->sendObserved(
-                'メール通知システムエラー',
-                '処理に失敗しました。分類: ' . $classification,
-            );
-            $result = $observed->result;
-            if ($observed->sequence !== null) {
-                if ($result->isSuccess()) {
-                    $this->healthMonitor->recordSuccess($observed->sequence);
-                } else {
-                    $this->healthMonitor->recordFailure(
-                        $observed->sequence, $result->classification, $messageIdHash,
-                    );
-                }
-            }
-            $this->safeLog(
-                $result->isSuccess() ? 'success' : 'failure',
-                $messageIdHash,
-                $result->isSuccess() ? $classification : $result->classification,
-                $result->httpStatus,
-                $result->diagnostic,
-            );
-            return;
+    public function report(
+        Throwable $error,
+        string $messageIdHash,
+        bool $forceWebhookFailure = false,
+        string $stage = 'delivery',
+        ?int $sequence = null,
+    ): void {
+        $classification = $forceWebhookFailure ? 'forced_test_failure' : 'internal_error';
+        $sequence ??= $this->healthMonitor?->reserveObservation();
+        if ($sequence !== null) {
+            $this->healthMonitor?->recordFailure($sequence, $classification, $messageIdHash);
         }
-
-        $result = $forceWebhookFailure
-            ? new WebhookResult(false, null, 'forced_test_failure')
-            : $this->webhook->send('メール通知システムエラー', '処理に失敗しました。分類: ' . $classification);
-        if ($result->isSuccess()) {
-            $this->safeLog('success', $messageIdHash, $classification, $result->httpStatus, $result->diagnostic);
-            return;
-        }
-
-        $this->safeLog(
-            'failure', $messageIdHash, $result->classification, $result->httpStatus, $result->diagnostic,
-        );
-    }
-
-    private function safeLog(
-        string $outcome,
-        string $hash,
-        string $classification,
-        ?int $status,
-        ?WebhookDiagnostic $diagnostic = null,
-    ): void
-    {
         try {
-            $this->logger->log($outcome, $hash, $classification, $status, $diagnostic);
+            $this->logger->logException($error, $messageIdHash, $stage, $classification);
         } catch (Throwable) {
             // Reporting must never break inbound mail delivery.
         }
     }
 
-    private static function classify(Throwable $error): string
-    {
-        return 'internal_error';
-    }
 }

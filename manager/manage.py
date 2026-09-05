@@ -1108,6 +1108,9 @@ class MailManager:
                 "healthy": "正常",
                 "degraded": "障害中",
             }.get(health_state, "状態ファイル不正")
+            pending = health_summary.get("pending_alert") if type(health_summary) is dict else None
+            if pending in {"error", "recovery"}:
+                health += "（%sメール送信保留）" % ("障害通知" if pending == "error" else "復旧通知")
         except Exception:
             health = "状態ファイル不正"
         release_configured = any(
@@ -1184,12 +1187,29 @@ class MailManager:
             "response_body_bytes", "response_body_sha256", "payload_bytes",
             "title_characters", "text_characters", "recovered_by_retry",
         }
-        if not isinstance(event, dict) or set(event) not in (legacy_keys, diagnostic_keys):
+        exception_keys = legacy_keys | {"stage", "exception_type", "source_file", "source_line"}
+        if not isinstance(event, dict) or set(event) not in (legacy_keys, diagnostic_keys, exception_keys):
             raise ValueError("invalid webhook diagnostic")
         if (set(event) == diagnostic_keys
                 and event["classification"] == "system_mail_suppressed"):
             raise ValueError("invalid webhook diagnostic")
         occurred_at = cls._validated_webhook_log_common(event)
+        if set(event) == exception_keys:
+            source = event["source_file"]
+            line = event["source_line"]
+            if (event["outcome"] != "failure" or event["http_status"] is not None
+                    or type(event["stage"]) is not str or event["stage"] not in {
+                        "delivery", "startup", "input", "clock", "parse", "dedup",
+                        "format", "webhook", "log", "alert_mail"}
+                    or type(event["exception_type"]) is not str or event["exception_type"] not in {
+                        "Throwable", "TypeError", "ValueError", "ParseError", "Error",
+                        "InvalidArgumentException", "RuntimeException", "LogicException", "Exception"}
+                    or not ((source is None and line is None) or (
+                        type(source) is str and re.fullmatch(
+                            r"(?:src/[A-Za-z][A-Za-z0-9]*|bin/[a-z][a-z0-9-]*|tests/php/test_[a-z0-9_]+)[.]php", source)
+                        and type(line) is int and line > 0))):
+                raise ValueError("invalid webhook diagnostic")
+            return occurred_at, False
         if set(event) == legacy_keys:
             return occurred_at, False
 
@@ -1245,6 +1265,7 @@ class MailManager:
         def json_classification():
             return {
                 "invalid parameter": "invalid_parameter",
+                "limit exceeded (body.text length exceeds 2000)": "invalid_parameter",
                 "missing parameter": "missing_parameter",
                 "invalid webhook URL": "invalid_webhook_url",
                 "too many request": "rate_limited",
@@ -1290,11 +1311,17 @@ class MailManager:
                             or type(relevant_status) is int
                             and 500 <= relevant_status <= 599):
                         raise ValueError("invalid webhook diagnostic")
-                elif (non_success_statuses != [400] or attempts[0] != 400
-                        or any(status != 200 for status in attempts[1:])
-                        or response_format != "json"
-                        or json_classification() != "invalid_parameter"):
-                    raise ValueError("invalid webhook diagnostic")
+                else:
+                    prefix = attempts[:len(non_success_statuses)]
+                    direct = prefix == [400]
+                    retry = len(prefix) == 2 and prefix[1] == 400 and (
+                        prefix[0] == 429 or 500 <= prefix[0] <= 599)
+                    compatibility = prefix == [500, 500, 400]
+                    if (not (direct or retry or compatibility)
+                            or any(status != 200 for status in attempts[len(prefix):])
+                            or response_format != "json"
+                            or json_classification() != "invalid_parameter"):
+                        raise ValueError("invalid webhook diagnostic")
         else:
             raise ValueError("invalid webhook diagnostic")
         return occurred_at, event["outcome"] == "failure" or recovered

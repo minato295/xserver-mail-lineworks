@@ -183,6 +183,7 @@ final class DeliverySendmailAdapter implements SendmailProcessAdapter
 {
     /** @var list<string> */
     public array $messages = [];
+    public int $exitCode = 0;
     public function start(array $argv): SendmailProcessHandle
     {
         return new class($this) implements SendmailProcessHandle {
@@ -194,10 +195,10 @@ final class DeliverySendmailAdapter implements SendmailProcessAdapter
             public function readStdout(): string { return ''; }
             public function readStderr(): string { return ''; }
             public function status(): array { return $this->closed
-                ? ['running' => false, 'exitCode' => 0]
+                ? ['running' => false, 'exitCode' => $this->owner->exitCode]
                 : ['running' => true, 'exitCode' => null]; }
             public function terminate(int $signal): void { $this->closed = true; }
-            public function close(): int { return 0; }
+            public function close(): int { return $this->owner->exitCode; }
         };
     }
 }
@@ -907,18 +908,20 @@ $applicationReporter = new ErrorReporter($applicationWebhook, $logger);
     . "--x\r\nContent-Disposition: attachment; filename=ATTACHMENT_MARKER.txt\r\n\r\nx\r\n--x--\r\n",
 );
 
+$errorHttpRequests = 0;
 $reporter = new ErrorReporter(
     new WebhookClient(
         'https://webhook.worksmobile.com/message/test-placeholder',
-        static fn (): array => [
+        static function () use (&$errorHttpRequests): array { ++$errorHttpRequests; return [
             'status' => 400,
             'body' => '{"code":"E400","description":"invalid parameter","raw":"REPORTER_RESPONSE_BODY_MARKER"}',
             'headers' => ['Content-Type' => 'application/json'],
-        ],
+        ]; },
     ),
     $logger,
 );
 $reporter->report(new RuntimeException('EXCEPTION_MESSAGE_MARKER'), str_repeat('b', 64));
+deliveryCheck($errorHttpRequests === 0, 'Error reporting must never send a LINE WORKS error message');
 
 $logs = file_get_contents($logPath);
 deliveryCheck($logs !== false && $logs !== '', 'Operational events must be logged');
@@ -953,9 +956,11 @@ deliveryCheck(array_slice($event, 5, null, true) === [
 deliveryCheck(($events[2]['attempt_http_statuses'] ?? null) === [500, 200]
     && ($events[2]['provider_code'] ?? null) === 'E500',
     'DeliveryApplication must pass webhook diagnostics to the operational log');
-deliveryCheck(($events[3]['attempt_http_statuses'] ?? null) === [400]
-    && ($events[3]['provider_code'] ?? null) === 'E400',
-    'ErrorReporter must pass error-webhook diagnostics to the operational log');
+deliveryCheck(($events[3]['exception_type'] ?? null) === 'RuntimeException'
+    && ($events[3]['stage'] ?? null) === 'delivery'
+    && is_string($events[3]['source_file'] ?? null)
+    && ($events[3]['source_line'] ?? 0) > 0,
+    'ErrorReporter must record safe exception type, stage and repository location');
 foreach ([
     'ADDRESS_MARKER@example.invalid', 'SUBJECT_MARKER', 'MAIL_BODY_MARKER', 'ATTACHMENT_MARKER.txt',
     'secret-placeholder', 'test-placeholder', 'EXCEPTION_MESSAGE_MARKER',
@@ -1936,7 +1941,7 @@ $brokenLogger = new OperationalLogger('/definitely/missing/directory/notifier.lo
 $appReporter = new ErrorReporter($appWebhook, $brokenLogger);
 $application = new DeliveryApplication($appWebhook, $appReporter, $brokenLogger);
 $application->deliver(file_get_contents(dirname(__DIR__) . '/fixtures/plain.eml') ?: '');
-deliveryCheck(count($appRequests) === 2, 'Internal delivery errors after reporter construction must be reported');
+deliveryCheck(count($appRequests) === 1, 'Log failure must not send any LINE WORKS error notification');
 $deliveredPayload = json_decode($appRequests[0], true, 512, JSON_THROW_ON_ERROR);
 deliveryCheck($deliveredPayload['title'] === '送信者 <sender@example.invalid>：お問い合わせ', 'Delivery must pass the formatter title to the webhook client');
 
@@ -2032,8 +2037,8 @@ $compatibilityDeliveryApplication->deliver($compatibilityDeliveryRaw);
 $compatibilityDeliveryApplication->deliver($compatibilityDeliveryRaw);
 deliveryCheck(count($compatibilityDeliveryPrimaryPayloads) === 3
     && $compatibilityDeliveryPrimaryPayloads[0] === $compatibilityDeliveryPrimaryPayloads[1]
-    && $compatibilityDeliveryAlertCalls === 2,
-    'Primary delivery alone must use one compatibility request while its error alert retains two attempts');
+    && $compatibilityDeliveryAlertCalls === 0,
+    'Primary delivery may use compatibility requests but never an error webhook');
 $compatibilityDeliveryFallback = json_decode($compatibilityDeliveryPrimaryPayloads[2], true, 512, JSON_THROW_ON_ERROR);
 deliveryCheck(
     str_contains($compatibilityDeliveryFallback['body']['text'], 'https：//www．example.invalid/path'),
@@ -2099,10 +2104,10 @@ $failedDeliveryEvents = array_map(
 );
 deliveryCheck($failedDeliveryPrimaryCalls === 2,
     'Duplicate final failures must make exactly one two-attempt primary webhook delivery');
-deliveryCheck($failedDeliveryAlertCalls === 1
+deliveryCheck($failedDeliveryAlertCalls === 0
     && count(array_filter($failedDeliveryEvents, static fn (array $event): bool => $event['outcome'] === 'success'
-        && $event['classification'] === 'internal_error')) === 1,
-    'Duplicate final failures must send and log exactly one successful error alert');
+        && $event['classification'] === 'internal_error')) === 0,
+    'Duplicate final failures must never send or log a successful error webhook');
 
 $ambiguousCommitPrimaryCalls = 0;
 $ambiguousCommitAlertCalls = 0;
@@ -2186,7 +2191,7 @@ file_put_contents($reportFailureLog, '');
 chmod($reportFailureLog, 0600);
 (new DeliveryApplication($reportFailureWebhook, $reportFailureReporter, new OperationalLogger($reportFailureLog)))
     ->deliver(file_get_contents(dirname(__DIR__) . '/fixtures/plain.eml') ?: '');
-deliveryCheck($reportFailureCalls === 2, 'Reporter failure must be swallowed without retrying the reporter');
+deliveryCheck($reportFailureCalls === 1, 'Internal retry error must not invoke an additional error webhook');
 unlink($reportFailureLog);
 rmdir($reportFailureDirectory);
 
@@ -2253,7 +2258,7 @@ $observedWebhook = new WebhookClient(
     'https://webhook.example.invalid/PRIVATE_WEBHOOK_MARKER',
     static function () use (&$observedCalls): array {
         ++$observedCalls;
-        if ($observedCalls <= 2) {
+        if ($observedCalls === 1) {
             throw new RuntimeException('EXCEPTION_MARKER webhook.example.invalid HMAC_KEY_MARKER');
         }
         return response(200, 'success');
@@ -2282,14 +2287,14 @@ $sensitiveRaw = "From: ORIGINAL_FROM_MARKER@example.invalid\r\n"
     . "Content-Disposition: attachment; filename=ORIGINAL_ATTACHMENT_MARKER.txt\r\n\r\nattachment\r\n"
     . "--privacy--\r\n";
 $observedApplication->deliver($sensitiveRaw);
-deliveryCheck($observedCalls === 2 && $healthMonitor->status() === 'degraded'
+deliveryCheck($observedCalls === 1 && $healthMonitor->status() === 'degraded'
     && count($healthSendmailAdapter->messages) === 1,
-    'Normal failure plus error-webhook failure must produce one outage transition');
+    'Actual notification failure must produce one outage transition without an error webhook');
 $degradedIntegration = json_decode((string) file_get_contents(
     $healthDirectory . '/delivery-health.json'), true, 16, JSON_THROW_ON_ERROR);
-deliveryCheck($degradedIntegration['next_observation_sequence'] === 2
-    && $degradedIntegration['last_applied_sequence'] === 2,
-    'Normal and error webhooks must reserve separate observations and apply only the error result');
+deliveryCheck($degradedIntegration['next_observation_sequence'] === 1
+    && $degradedIntegration['last_applied_sequence'] === 1,
+    'Actual delivery result must be the only health observation');
 $expectedRealErrorBody = "LINE WORKSへのメール通知で障害が発生しました。\n"
     . "復旧するまで、LINE WORKSへ通知されない可能性があります。\n\n"
     . "【必要な対応】\nXserverのメールボックスで新着メールを直接確認してください。\n"
@@ -2303,13 +2308,13 @@ deliveryCheck($decodedRealError['subject'] === '【要確認】LINE WORKSメー�
     && $decodedRealError['body'] === $expectedRealErrorBody,
     'Integrated outage subject and body must match the approved Japanese copy');
 $observedApplication->deliver($otherRaw);
-deliveryCheck($observedCalls === 3 && $healthMonitor->status() === 'healthy'
+deliveryCheck($observedCalls === 2 && $healthMonitor->status() === 'healthy'
     && count($healthSendmailAdapter->messages) === 2,
     'Next normal webhook success must produce one recovery transition');
 $healthyIntegration = json_decode((string) file_get_contents(
     $healthDirectory . '/delivery-health.json'), true, 16, JSON_THROW_ON_ERROR);
-deliveryCheck($healthyIntegration['next_observation_sequence'] === 3
-    && $healthyIntegration['last_applied_sequence'] === 3,
+deliveryCheck($healthyIntegration['next_observation_sequence'] === 2
+    && $healthyIntegration['last_applied_sequence'] === 2,
     'Logical success must reserve and apply exactly one observation');
 $expectedRealRecoveryBody = "LINE WORKSへのメール通知は復旧しました。\n"
     . "今後受信する対象メールは通常どおり通知されます。\n\n"
@@ -2356,8 +2361,8 @@ $rateObservedClient = new WebhookClient(
 $rateObservation = $rateObservedClient->sendObserved('Title', 'Text');
 $rateState = json_decode((string) file_get_contents(
     $healthDirectory . '/delivery-health.json'), true, 16, JSON_THROW_ON_ERROR);
-deliveryCheck($rateObservation->sequence === 4 && $rateObservedCalls === 2
-    && $rateState['next_observation_sequence'] === 4,
+deliveryCheck($rateObservation->sequence === 3 && $rateObservedCalls === 2
+    && $rateState['next_observation_sequence'] === 3,
     'One logical 429 retry must reserve only one observation');
 
 $chunkObservedCalls = 0;
@@ -2375,8 +2380,8 @@ $chunkObservedClient = new WebhookClient(
 $chunkObservation = $chunkObservedClient->sendObserved('Title', $longText);
 $chunkState = json_decode((string) file_get_contents(
     $healthDirectory . '/delivery-health.json'), true, 16, JSON_THROW_ON_ERROR);
-deliveryCheck($chunkObservation->sequence === 5 && $chunkObservedCalls > 2
-    && $chunkState['next_observation_sequence'] === 5,
+deliveryCheck($chunkObservation->sequence === 4 && $chunkObservedCalls > 2
+    && $chunkState['next_observation_sequence'] === 4,
     'Full request and all chunk requests must share one logical observation');
 
 $invalidObservedCalls = 0;
@@ -2390,10 +2395,42 @@ $invalidObservedClient = new WebhookClient(
 $invalidObservation = $invalidObservedClient->sendObserved('Title', "\xff");
 $invalidObservedState = json_decode((string) file_get_contents(
     $healthDirectory . '/delivery-health.json'), true, 16, JSON_THROW_ON_ERROR);
-deliveryCheck($invalidObservation->sequence === 6 && $invalidObservedCalls === 0
+deliveryCheck($invalidObservation->sequence === 5 && $invalidObservedCalls === 0
     && $invalidObservation->result->classification === 'invalid_payload'
-    && $invalidObservedState['next_observation_sequence'] === 6,
+    && $invalidObservedState['next_observation_sequence'] === 5,
     'Pre-HTTP payload failure must reserve one synthetic observation and perform no HTTP');
+
+$healthSendmailAdapter->exitCode = 1;
+$parseFailureApplication = new DeliveryApplication(
+    $observedWebhook, $observedReporter, $healthLogger, null, null, $healthAuth, $healthMonitor,
+    parser: static function (string $raw, DateTimeImmutable $now): never {
+        throw new RuntimeException('PRIVATE_PARSE_SECRET user@example.invalid https://secret.invalid/token');
+    },
+);
+$parseFailureApplication->deliver($sensitiveRaw);
+$parseFailureState = json_decode((string) file_get_contents(
+    $healthDirectory . '/delivery-health.json'), true, 16, JSON_THROW_ON_ERROR);
+deliveryCheck($observedCalls === 2 && $parseFailureState['status'] === 'degraded'
+    && $parseFailureState['pending_alert_type'] === 'error',
+    'Real parser failure must send no HTTP and persist degraded even when alert mail fails');
+$parseLog = (string) file_get_contents($healthLog);
+deliveryCheck(!str_contains($parseLog, 'PRIVATE_PARSE_SECRET')
+    && !str_contains($parseLog, 'user@example.invalid')
+    && !str_contains($parseLog, 'https://secret.invalid/token'),
+    'Secret-bearing exceptions must not leak message or arguments');
+$parseEvents = array_map(static fn (string $line): array => json_decode($line, true),
+    array_filter(explode("\n", $parseLog)));
+$parseEvent = end($parseEvents);
+deliveryCheck($parseEvent['stage'] === 'parse' && $parseEvent['exception_type'] === 'RuntimeException'
+    && $parseEvent['source_file'] === 'tests/php/test_delivery.php' && $parseEvent['source_line'] > 0,
+    'Parser failure must retain usable private stage, standard exception type and location');
+$healthSendmailAdapter->exitCode = 0;
+$parseFailureApplication->deliver($sensitiveRaw);
+deliveryCheck($healthMonitor->status() === 'degraded' && $observedCalls === 2,
+    'Successful alert retry must never be mistaken for notification recovery');
+$observedApplication->deliver($otherRaw);
+deliveryCheck($healthMonitor->status() === 'healthy' && $observedCalls === 3,
+    'Only a real subsequent normal delivery may recover from parser failure');
 
 $forcedHealthDirectory = sys_get_temp_dir() . '/delivery-forced-health-' . bin2hex(random_bytes(8));
 mkdir($forcedHealthDirectory, 0700);
@@ -2512,10 +2549,10 @@ $duplicateOutageApplication = new DeliveryApplication(
 $duplicateOutageRaw = str_replace('<same@example.invalid>', '<duplicate-outage@example.invalid>', $sameRaw);
 $duplicateOutageApplication->deliver($duplicateOutageRaw);
 $duplicateOutageApplication->deliver($duplicateOutageRaw);
-deliveryCheck($duplicateOutagePrimaryCalls === 2 && $duplicateOutageAlertCalls === 2
+deliveryCheck($duplicateOutagePrimaryCalls === 2 && $duplicateOutageAlertCalls === 0
     && count($duplicateOutageAdapter->messages) === 1
     && $duplicateOutageMonitor->status() === 'degraded',
-    'Duplicate failed deliveries must create one error-alert retry pair and one degraded outage transition');
+    'Duplicate failed deliveries must create no error webhook and one degraded outage transition');
 
 $preflightDirectory = sys_get_temp_dir() . '/delivery-preflight-' . bin2hex(random_bytes(8));
 mkdir($preflightDirectory, 0700);

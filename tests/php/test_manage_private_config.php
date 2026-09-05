@@ -881,6 +881,24 @@ try {
         unlink($healthPath);
     }
 
+    $pendingHealth = [
+        'schema_version' => 2, 'status' => 'healthy',
+        'changed_at' => '2026-07-13T01:00:00Z',
+        'next_observation_sequence' => 3, 'last_applied_sequence' => 3,
+        'pending_alert_type' => 'recovery',
+        'pending_alert_changed_at' => '2026-07-13T01:00:00Z',
+        'pending_alert_failure_at' => '2026-07-13T00:00:00Z',
+        'pending_alert_classification' => 'transport_error',
+    ];
+    file_put_contents($healthPath, json_encode($pendingHealth, JSON_THROW_ON_ERROR));
+    chmod($healthPath, 0600);
+    $pendingResponse = runHelper($helper, ['schema_version' => 1, 'operation' => 'health-summary']);
+    check($pendingResponse['code'] === 0, 'Schema2 pending recovery must remain readable');
+    $pendingDecoded = json_decode($pendingResponse['stdout'], true, 16, JSON_THROW_ON_ERROR);
+    check($pendingDecoded['state'] === 'healthy' && $pendingDecoded['pending_alert'] === 'recovery',
+        'Summary must distinguish actual health from pending alert');
+    unlink($healthPath);
+
     $validHealthFixture = [
         'schema_version' => 1, 'status' => 'degraded',
         'changed_at' => '2026-07-13T00:00:00Z', 'classification' => 'transport_error',

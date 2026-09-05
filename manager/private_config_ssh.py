@@ -214,6 +214,9 @@ class PrivateConfigSsh:
             "schema_version", "state", "changed_at", "classification",
             "next_observation_sequence", "last_applied_sequence",
         }
+        version = result.get("schema_version") if type(result) is dict else None
+        if version == 2:
+            keys.add("pending_alert")
         valid = type(result) is dict and set(result) == keys
         if valid:
             state = result.get("state")
@@ -223,7 +226,7 @@ class PrivateConfigSsh:
             applied_sequence = result.get("last_applied_sequence")
             valid = (
                 type(result.get("schema_version")) is int
-                and result["schema_version"] == 1
+                and result["schema_version"] in {1, 2}
                 and type(state) is str and state in {"missing", "healthy", "degraded"}
                 and (classification is None or (
                     type(classification) is str
@@ -252,9 +255,18 @@ class PrivateConfigSsh:
                     and type(classification) is str
                     and classification in _HEALTH_CLASSIFICATIONS - {"success"})
             )
+            if version == 2:
+                pending = result.get("pending_alert")
+                valid = valid and (pending is None
+                    or type(pending) is str and (
+                        state == "healthy" and pending == "recovery"
+                        or state == "degraded" and pending == "error"))
         if not valid:
             raise RuntimeError("秘密設定応答を確認できません。")
-        return {key: result[key] for key in (
+        summary = {key: result[key] for key in (
             "state", "changed_at", "classification", "next_observation_sequence",
             "last_applied_sequence",
         )}
+        if version == 2:
+            summary["pending_alert"] = result["pending_alert"]
+        return summary

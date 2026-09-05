@@ -88,7 +88,9 @@ try {
         $exitCode = 1;
     } else {
         try {
-            $reporter->report($error, hash('sha256', 'startup'));
+            if (!$checkMode && !$messageCheckMode) {
+                $reporter->report($error, hash('sha256', 'startup'), false, 'startup');
+            }
         } catch (Throwable) {
             // Reporting must not block inbound mail delivery.
         }

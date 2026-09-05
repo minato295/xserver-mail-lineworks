@@ -470,14 +470,21 @@ $failedAdapter->exitCode = 1;
 $failedSequence = $failedTransition->reserveObservation();
 $failedTransition->recordFailure($failedSequence, 'transport_error', str_repeat('c', 64));
 $afterSendFailure = json_decode($failedFs->files[$failedPath], true, 16, JSON_THROW_ON_ERROR);
-healthCheck($afterSendFailure['status'] === 'healthy'
+healthCheck($afterSendFailure['status'] === 'degraded'
+    && $afterSendFailure['pending_alert_type'] === 'error'
     && $afterSendFailure['last_applied_sequence'] === $failedSequence,
-    'Sendmail failure must retain state but advance last_applied_sequence');
+    'Sendmail failure must persist degraded health independently of pending alert transport');
 $failedAdapter->exitCode = 0;
 $retrySequence = $failedTransition->reserveObservation();
 $failedTransition->recordFailure($retrySequence, 'transport_error', str_repeat('c', 64));
 healthCheck($failedTransition->status() === 'degraded' && count($failedAdapter->messages) === 2,
     'Next new sequence must retry a failed transition email');
+$afterRetry = json_decode($failedFs->files[$failedPath], true, 16, JSON_THROW_ON_ERROR);
+healthCheck(!isset($afterRetry['pending_alert_type']) && $afterRetry['schema_version'] === 2,
+    'Successful alert must clear only pending transport state');
+$failedTransition->recordSuccess($failedSequence);
+healthCheck($failedTransition->status() === 'degraded' && count($failedAdapter->messages) === 2,
+    'Stale completion after alert retry must not recover health or send a stale alert');
 unlink($failedLog);
 
 $failedRecoveryTimes = [
@@ -502,26 +509,42 @@ $failedRecovery->recordSuccess($failedRecoverySequence);
 $afterRecoverySendFailure = json_decode(
     $failedRecoveryFs->files[$failedRecoveryPath], true, 16, JSON_THROW_ON_ERROR,
 );
-healthCheck($afterRecoverySendFailure['status'] === 'degraded'
-    && $afterRecoverySendFailure['changed_at'] === '2026-07-14T08:33:55Z'
+healthCheck($afterRecoverySendFailure['status'] === 'healthy'
+    && $afterRecoverySendFailure['pending_alert_type'] === 'recovery'
+    && $afterRecoverySendFailure['changed_at'] === '2026-07-14T08:35:10Z'
     && $afterRecoverySendFailure['last_applied_sequence'] === $failedRecoverySequence,
-    'Recovery sendmail failure must retain degraded state and outage time but advance the sequence');
+    'Recovery mail failure must not undo confirmed delivery recovery');
 $failedRecoveryAdapter->exitCode = 0;
 $recoveryRetrySequence = $failedRecovery->reserveObservation();
 $failedRecovery->recordSuccess($recoveryRetrySequence);
 healthCheck($failedRecovery->status() === 'healthy' && count($failedRecoveryAdapter->messages) === 3,
     'Next new success observation must retry a failed recovery email');
+healthCheck($failedRecoveryAdapter->messages[1] === $failedRecoveryAdapter->messages[2],
+    'Recovery retry must retain the actual recovery and failure timestamps');
 unlink($failedRecoveryLog);
+
+[$superseded, $supersededFs, $supersededMail, $supersededPath, $supersededLog] = fakeMonitor();
+$superseded->recordFailure($superseded->reserveObservation(), 'transport_error', str_repeat('2', 64));
+$supersededMail->exitCode = 1;
+$superseded->recordSuccess($superseded->reserveObservation());
+$supersededMail->exitCode = 0;
+$superseded->recordFailure($superseded->reserveObservation(), 'http_error', str_repeat('3', 64));
+$newAlert = decodeHealthWire($supersededMail->messages[2]);
+healthCheck($superseded->status() === 'degraded'
+    && str_contains($newAlert['subject'], '障害が発生しました')
+    && !str_contains($newAlert['subject'], '復旧'),
+    'A new outage must supersede a stale unsent recovery alert');
+unlink($supersededLog);
 
 [$crashMonitor, $crashFs, $crashMail, , $crashLog] = fakeMonitor();
 $crashSequence = $crashMonitor->reserveObservation();
 $crashFs->faults[] = 'post_replace';
 $crashMonitor->recordFailure($crashSequence, 'transport_error', str_repeat('d', 64));
-healthCheck(count($crashMail->messages) === 1, 'Crash-window fixture must send before state commit failure');
+healthCheck(count($crashMail->messages) === 0, 'Health must be durably saved before any alert is sent');
 $crashRetry = $crashMonitor->reserveObservation();
 $crashMonitor->recordFailure($crashRetry, 'transport_error', str_repeat('d', 64));
-healthCheck(count($crashMail->messages) === 2,
-    'Only sendmail-success/state-commit crash window may produce at-least-once duplicate');
+healthCheck(count($crashMail->messages) === 1,
+    'A failed pre-send state commit must not create duplicate alerts');
 unlink($crashLog);
 
 $nativeDirectory = sys_get_temp_dir() . '/health-native-' . bin2hex(random_bytes(8));

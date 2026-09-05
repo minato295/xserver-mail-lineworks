@@ -104,6 +104,49 @@ final class OperationalLogger
         $this->append($line);
     }
 
+    public function logException(
+        Throwable $error,
+        string $messageIdHash,
+        string $stage,
+        string $classification = 'internal_error',
+    ): void {
+        $this->assertCommonContract('failure', $classification, null, false);
+        $stages = ['delivery', 'startup', 'input', 'clock', 'parse', 'dedup', 'format',
+            'webhook', 'log', 'alert_mail'];
+        $safeStage = in_array($stage, $stages, true) ? $stage : 'delivery';
+        $type = 'Throwable';
+        foreach ([\TypeError::class, \ValueError::class, \ParseError::class, \Error::class,
+            \InvalidArgumentException::class, \RuntimeException::class,
+            \LogicException::class, \Exception::class] as $standardType) {
+            if ($error instanceof $standardType) { $type = $standardType; break; }
+        }
+        // Never serialize exception messages, custom class names, traces, or arguments.
+        $location = null;
+        $line = null;
+        $root = dirname(__DIR__) . '/';
+        $file = $error->getFile();
+        $allowed = array_merge(glob($root . 'src/*.php') ?: [],
+            glob($root . 'bin/*.php') ?: [], glob($root . 'tests/php/test_*.php') ?: []);
+        if (in_array($file, $allowed, true)) {
+            $location = substr($file, strlen($root));
+            $line = $error->getLine();
+        }
+        $now = ($this->utcClock)();
+        if (!$now instanceof DateTimeImmutable) {
+            throw new RuntimeException('Operational log unavailable');
+        }
+        $this->append(json_encode([
+            'timestamp' => $now->setTimezone(new DateTimeZone('UTC'))->format(DATE_ATOM),
+            'outcome' => 'failure',
+            'message_id_hash' => preg_match('/\A[a-f0-9]{64}\z/D', $messageIdHash) === 1
+                ? $messageIdHash : hash('sha256', $messageIdHash),
+            'classification' => $classification,
+            'http_status' => null,
+            'stage' => $safeStage, 'exception_type' => $type,
+            'source_file' => $location, 'source_line' => $line,
+        ], JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES) . "\n");
+    }
+
     private function assertCommonContract(
         string $outcome,
         string $classification,

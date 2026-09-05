@@ -48,14 +48,18 @@ final class DeliveryApplication
         }
         $messageIdHash = hash('sha256', $raw);
         $reservation = null;
+        $stage = 'input';
+        $sequence = null;
         try {
             if (strlen($raw) > 10 * 1024 * 1024) {
                 throw new RuntimeException('Input exceeds limit');
             }
+            $stage = 'clock';
             $now = ($this->utcClock)();
             if (!$now instanceof DateTimeImmutable) {
                 throw new RuntimeException('Invalid delivery clock');
             }
+            $stage = 'parse';
             $message = ($this->parser)($raw, $now);
             if (!$message instanceof MailMessage) {
                 throw new RuntimeException('Invalid parser result');
@@ -95,17 +99,27 @@ final class DeliveryApplication
                 }
                 return;
             }
+            $stage = 'format';
             $formatter = new NotificationFormatter();
+            $title = $formatter->title($message);
+            $text = $formatter->format($message);
+            $stage = 'webhook';
             $observed = $this->webhook->sendObservedWithCompatibility(
-                $formatter->title($message), $formatter->format($message),
+                $title, $text,
             );
+            $sequence = $observed->sequence;
             $result = $observed->result;
             if ($result->isSuccess()) {
                 if ($observed->sequence !== null) {
                     $this->healthMonitor?->recordSuccess($observed->sequence);
                 }
+            } elseif ($observed->sequence !== null) {
+                $this->healthMonitor?->recordFailure(
+                    $observed->sequence, $result->classification, $messageIdHash,
+                );
             }
             $this->commitReservation($messageIdHash, $reservation);
+            $stage = 'log';
             $this->logger->log(
                 $result->isSuccess() ? 'success' : 'failure',
                 $messageIdHash,
@@ -115,11 +129,15 @@ final class DeliveryApplication
             );
         } catch (Throwable $error) {
             $this->commitReservation($messageIdHash, $reservation);
-            $this->safeReport($error, $messageIdHash);
+            if ($stage === 'log') {
+                try {
+                    $this->logger->logException($error, $messageIdHash, $stage);
+                } catch (Throwable) {
+                }
+            } else {
+                $this->safeReport($error, $messageIdHash, false, $stage, $sequence);
+            }
             return;
-        }
-        if (!$result->isSuccess()) {
-            $this->safeReport(new RuntimeException('Webhook delivery failed'), $messageIdHash);
         }
     }
 
@@ -163,10 +181,11 @@ final class DeliveryApplication
         }
     }
 
-    private function safeReport(Throwable $error, string $messageIdHash, bool $forceWebhookFailure = false): void
+    private function safeReport(Throwable $error, string $messageIdHash, bool $forceWebhookFailure = false,
+        string $stage = 'delivery', ?int $sequence = null): void
     {
         try {
-            $this->reporter->report($error, $messageIdHash, $forceWebhookFailure);
+            $this->reporter->report($error, $messageIdHash, $forceWebhookFailure, $stage, $sequence);
         } catch (Throwable) {
             // Inbound mail delivery must remain fail-open even if reporting fails.
         }
