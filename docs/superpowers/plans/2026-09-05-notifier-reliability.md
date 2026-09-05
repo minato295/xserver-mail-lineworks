@@ -22,25 +22,26 @@
 
 Files: src/ErrorReporter.php, src/DeliveryApplication.php, src/DeliveryHealthMonitor.php, src/OperationalLogger.php or dedicated diagnostic writer, bin/mail-to-lineworks.php, health schema readers in manager/ and bin/manage-private-config.php; tests/php/test_delivery.php and test_health_monitor.php, affected Python schema tests.
 
-- [ ] Reproduce real application error with mocked HTTP: assert zero error HTTP requests, failure health even if sendmail fails, no alert-only recovery.
-- [ ] Implement pending alert state independent of delivery state; retain legacy reads and monotonic observations. Tests must exercise failed error mail followed by retry and failed recovery mail followed by retry, plus concurrency.
-- [ ] Record safe exception stage/type/location, not message or args. Test a secret-bearing exception and verify absent secret with usable stage and location.
-- [ ] Run affected PHP/Python tests and commit task changes.
+- [x] Reproduce real application error with mocked HTTP: assert zero error HTTP requests, failure health even if sendmail fails, no alert-only recovery.
+- [x] Implement pending alert state independent of delivery state; retain legacy reads and monotonic observations. Tests exercise failed error mail followed by retry and failed recovery mail followed by retry, plus concurrency.
+- [x] Record safe exception stage/type/location, not message or args. Test a secret-bearing exception and verify absent secret with usable stage and location.
+- [x] Run affected PHP/Python tests and commit task changes.
 
 ### Task 2: Private recovery and bounded deduplication
 
 Files: src/DeliveryDeduplicator.php, new private outbox component and tests, src/DeliveryApplication.php, src/WebhookClient.php, CLI recovery integration.
 
-- [ ] Reproduce oversized expired dedup state; ensure it can be compacted and future duplicate suppression works. Prevent writing unreadable state.
-- [ ] Persist failed delivery text with idempotent key, state, and confirmed progress. List pending/uncertain work without sending; replay only explicit selected work. Preserve the current recipient allowlist and current webhook settings at retry time.
-- [ ] Test full failure, partial split, uncertain transport, parallel reserve, storage limits, and no sends in list/check mode with injected transports.
-- [ ] Document deliberate retry workflow and commit.
+- [x] Reproduce oversized expired dedup state; ensure it can be compacted and future duplicate suppression works. Prevent writing unreadable state.
+- [x] Persist failed delivery text with idempotent key, state, and confirmed progress. List pending/uncertain work without sending; replay only explicit selected work. Preserve the current recipient allowlist and current webhook settings at retry time.
+- [x] Test full failure, partial split, uncertain transport, parallel reserve, storage limits, and no sends in list/check mode with injected transports.
+- [x] Document deliberate retry workflow and commit.
+- [x] Address independent-review finding: bounded private directory-lock contention handling, retaining inode/ancestor identity checks and timeout refusal.
 
 ### Task 3: Public information and integration
 
 Files: README.md, affected docs, tests/run-all.sh or extracted public scanner with tests.
 
-- [ ] Replace actual environment paths with /home/example/... in tracked documentation.
-- [ ] Add scanner regression for account paths, including /home/s1234/private/...; legitimate example.invalid remains allowed.
+- [x] Replace actual environment paths with /home/example/... in tracked documentation.
+- [x] Add scanner regression for private account paths; legitimate example.invalid remains allowed.
 - [ ] Run complete offline suite and public scan. Independent review and address substantive findings.
 - [ ] Publish through reviewed PR and deploy using existing verified workflow; verify release readback without notification tests.

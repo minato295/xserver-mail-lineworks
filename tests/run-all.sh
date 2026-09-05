@@ -40,6 +40,7 @@ php -d assert.exception=1 tests/php/test_sendmail_client.php
 php -d assert.exception=1 tests/php/test_health_monitor.php
 php -d assert.exception=1 tests/php/test_delivery.php
 php -d assert.exception=1 tests/php/test_dedup_capacity.php
+php -d assert.exception=1 tests/php/test_private_state_lock_wait.php
 php -d assert.exception=1 tests/php/test_outbox.php
 php -d assert.exception=1 tests/php/test_recovery.php
 php -d assert.exception=1 tests/php/test_outbox_cli.php
