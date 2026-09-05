@@ -59,7 +59,7 @@ def _legacy_bootstrap_asset_paths(manager_file=__file__):
         return (fixed / "manage-private-config.php",
                 fixed / "legacy-manifest.json", 0o600)
     repository = container
-    return (repository / "bin/manage-private-config.php",
+    return (repository / "fixed-runtime/legacy-manage-private-config.php",
             repository / "fixed-runtime/legacy-manifest.json", 0o644)
 
 
@@ -345,13 +345,14 @@ class MailManager:
 13. 通知対象を転送設定から同期
 14. Webhook URL確認
 15. Webhook URL変更
+16. 未送信通知一覧・選択再送
 0. 終了"""
 
     def __init__(self, api, deployer, command_path, *, input_fn=input, output_fn=print,
                  error_recipients=None, diagnostic_fn=None, lineworks_test_fn=None,
                  error_mail_test_fn=None, config=None, now_fn=None, test_token_fn=None,
                  release_workflow=None, initial_command_path=None,
-                 private_config_client=None, webhook_sender=None):
+                 private_config_client=None, webhook_sender=None, recovery_client=None):
         self.api = api
         self.deployer = deployer
         self.command_path = command_path
@@ -367,6 +368,7 @@ class MailManager:
         self.error_mail_test_fn = error_mail_test_fn or self._default_error_mail_test
         self.release_workflow = release_workflow
         self.private_config_client = private_config_client
+        self.recovery_client = recovery_client
         if (self.private_config_client is None and callable(getattr(deployer, "read", None))
                 and callable(getattr(deployer, "compare_and_swap", None))):
             self.private_config_client = deployer
@@ -1156,7 +1158,7 @@ class MailManager:
             "success", "invalid_payload", "invalid_parameter", "missing_parameter",
             "invalid_webhook_url", "rate_limited", "http_error", "transport_error",
             "forced_test_failure", "internal_error", "system_mail_suppressed",
-            "health_state_failure", "unknown", "dedup_store_failure",
+            "health_state_failure", "unknown", "dedup_store_failure", "outbox_store_failure",
             "non_target_recipient",
         }
         status = event["http_status"]
@@ -1291,8 +1293,14 @@ class MailManager:
                     event["http_status"] == 200 and code == 200
                     and safe_description == "success"
                 )
+                legacy_length_failure = (
+                    event["http_status"] == 400 and code in (400, "400")
+                    and safe_description == "limit exceeded (body.text length exceeds 2000)"
+                    and event["classification"] == "http_error"
+                )
                 if (event["http_status"] is None or successful_response
-                        or event["classification"] != json_classification()):
+                        or (event["classification"] != json_classification()
+                            and not legacy_length_failure)):
                     raise ValueError("invalid webhook diagnostic")
         elif event["outcome"] == "success":
             if attempt_count == 1:
@@ -1778,6 +1786,16 @@ class MailManager:
         self.output("初回filter移行が完了しました。メール原本の消失はありません。")
         return True
 
+    def recover_notifications(self):
+        try:
+            from manager.recovery import show_recovery_menu
+        except ModuleNotFoundError:
+            from recovery import show_recovery_menu
+        if self.recovery_client is None:
+            self.output('未送信通知の接続設定を確認できません。')
+            return
+        show_recovery_menu(self.recovery_client, lambda: self.input(''), self.output)
+
     def run(self):
         actions = {
             "1": self.list_targets, "2": self.add_targets,
@@ -1788,6 +1806,7 @@ class MailManager:
             "10": self.send_lineworks_test, "11": self.send_error_mail_test,
             "12": self.deploy_release, "13": self.sync_targets,
             "14": self.show_webhook_url, "15": self.change_webhook_url,
+            "16": self.recover_notifications,
         }
         while True:
             self.output(self.MENU)
@@ -1811,6 +1830,7 @@ def _run_main():
         from manager.release_deployer import ReleaseDeployer
         from manager.release_workflow import ReleaseWorkflow
         from manager.private_config_ssh import PrivateConfigSsh
+        from manager.recovery import RecoverySsh
     except ModuleNotFoundError:  # Support `python3 manager/manage.py` from the repository root.
         from ftps_deployer import FtpsDeployer
         from keychain import Keychain
@@ -1819,6 +1839,7 @@ def _run_main():
         from release_deployer import ReleaseDeployer
         from release_workflow import ReleaseWorkflow
         from private_config_ssh import PrivateConfigSsh
+        from recovery import RecoverySsh
 
     required = (
         "XSERVER_SERVERNAME", "XSERVER_COMMAND_PATH", "XSERVER_FTPS_HOST",
@@ -1867,6 +1888,18 @@ def _run_main():
         os.environ["XSERVER_SSH_ALIAS"], os.environ["XSERVER_HOME"],
         expected_hosts=expected_hosts,
     )
+    recovery_client = RecoverySsh(os.environ["XSERVER_SSH_ALIAS"], os.environ["XSERVER_HOME"],
+                                  expected_hosts=expected_hosts)
+    arguments = sys.argv[1:]
+    if arguments and arguments[0] in {'outbox-list', 'outbox-retry'}:
+        if arguments == ['outbox-list']:
+            print(json.dumps({'schema_version': 1, 'items': recovery_client.list_items()}))
+            return 0
+        if (len(arguments) == 4 and arguments[0] == 'outbox-retry'
+                and arguments[2] == '--expected-revision'):
+            print(json.dumps(recovery_client.retry_selected(arguments[1], arguments[3])))
+            return 0
+        raise ValueError('未送信通知の引数が不正です。')
     try:
         try:
             config, _config_sha256 = private_config_client.read()
@@ -1889,6 +1922,7 @@ def _run_main():
         api, deployer, wrapper_command_path,
         config=config, error_recipients=recipients, release_workflow=release_workflow,
         initial_command_path=stable_command_path, private_config_client=private_config_client,
+        recovery_client=recovery_client,
     ).run()
     return 0
 

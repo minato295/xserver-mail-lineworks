@@ -24,6 +24,7 @@ final class DeliveryApplication
         private readonly ?DeliveryHealthMonitor $healthMonitor = null,
         ?callable $utcClock = null,
         ?callable $parser = null,
+        private readonly ?DeliveryOutbox $outbox = null,
     ) {
         $this->utcClock = Closure::fromCallable(
             $utcClock ?? static fn (): DateTimeImmutable => new DateTimeImmutable('now'),
@@ -103,12 +104,44 @@ final class DeliveryApplication
             $formatter = new NotificationFormatter();
             $title = $formatter->title($message);
             $text = $formatter->format($message);
+            $outboxToken = null;
+            if ($this->outbox !== null) {
+                try {
+                    $outboxToken = $this->outbox->begin(
+                        $messageIdHash, $message->visibleRecipientAddresses, $title, $text,
+                    );
+                    if ($outboxToken === null) {
+                        $this->commitReservation($messageIdHash, $reservation);
+                        return;
+                    }
+                } catch (DeliveryOutboxConflict) {
+                    $this->commitReservation($messageIdHash, $reservation);
+                    return;
+                } catch (Throwable) {
+                    try {
+                        $this->logger->log('failure', $messageIdHash, 'outbox_store_failure', null);
+                    } catch (Throwable) {
+                    }
+                    // Preserve inbound delivery when private recovery storage is unavailable.
+                }
+            }
             $stage = 'webhook';
             $observed = $this->webhook->sendObservedWithCompatibility(
                 $title, $text,
             );
             $sequence = $observed->sequence;
             $result = $observed->result;
+            if ($outboxToken !== null) {
+                try {
+                    $this->outbox?->finish($messageIdHash, $outboxToken, $result);
+                } catch (Throwable) {
+                    try {
+                        $this->logger->log('failure', $messageIdHash, 'outbox_store_failure', null);
+                    } catch (Throwable) {
+                    }
+                    // An uncertain persisted operation remains review-only, never automatically replayed.
+                }
+            }
             if ($result->isSuccess()) {
                 if ($observed->sequence !== null) {
                     $this->healthMonitor?->recordSuccess($observed->sequence);
