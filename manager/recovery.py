@@ -1,23 +1,50 @@
 """Explicit selected recovery through the existing authenticated SSH boundary."""
 import json
 import re
+import shlex
 from datetime import datetime, timedelta, timezone
 
 try:
-    from manager.private_config_ssh import PrivateConfigSsh
+    from manager import private_config_ssh, remote_validator
 except ModuleNotFoundError:
-    from private_config_ssh import PrivateConfigSsh
+    import private_config_ssh
+    import remote_validator
 
 _HASH = re.compile(r'[a-f0-9]{64}\Z')
 _FIELDS = {'id', 'revision', 'state', 'created_at', 'expires_at', 'completed_chunks',
            'total_chunks', 'classification', 'retryable'}
 
 
-class RecoverySsh(PrivateConfigSsh):
+class RecoverySsh:
+    def __init__(self, ssh_alias, filesystem_home, *, expected_hosts, runner=None):
+        # Recovery is not a private-config operation. Reuse only the non-secret
+        # validation policy and trusted SSH boundary, not the mutable config client.
+        if (type(filesystem_home) is not str
+                or private_config_ssh._HOME.fullmatch(filesystem_home) is None):
+            raise ValueError('filesystem_home is invalid')
+        if (type(expected_hosts) is not list or not expected_hosts
+                or len(set(expected_hosts)) != len(expected_hosts)
+                or any(type(host) is not str or private_config_ssh._HOST.fullmatch(host) is None
+                       for host in expected_hosts)):
+            raise ValueError('expected_hosts is invalid')
+        bootstrap = filesystem_home + '/private/xserver-mail-lineworks/bootstrap/mail-forward-command.php'
+        self.remote_command = '/usr/bin/php8.5 ' + shlex.quote(bootstrap)
+        self.expected_hosts = list(expected_hosts)
+        self.validator = remote_validator.RemoteValidator(
+            ssh_alias, runner if runner is not None else remote_validator.bounded_subprocess_run)
+
+    @staticmethod
+    def _unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError('duplicate')
+            value[key] = item
+        return value
+
     def _call(self, arguments):
-        command = self.remote_command.removesuffix('manage-private-config.php') + 'mail-forward-command.php'
         # Every argument is either a fixed literal or prevalidated lowercase hex.
-        output = self.validator.run_trusted(command + ' ' + ' '.join(arguments), b'',
+        output = self.validator.run_trusted(self.remote_command + ' ' + ' '.join(arguments), b'',
             expected_hosts=self.expected_hosts, output_limit=131072)
         try:
             if type(output) is not bytes or len(output) > 131072: raise ValueError()

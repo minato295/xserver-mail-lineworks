@@ -1,9 +1,42 @@
 import json
+from pathlib import Path
+import subprocess
+import sys
 import unittest
 from unittest.mock import patch
 
 
 class RecoveryTest(unittest.TestCase):
+    def test_cold_recovery_import_during_mocked_config_bootstrap_does_not_poison_client(self):
+        # Reproduce the discovery-order failure in a fresh interpreter. Only the
+        # private-config client is mocked during first import; recovery must still
+        # use its own real validation and the trusted SSH boundary afterward.
+        script = '''
+import json
+from unittest.mock import patch
+with patch('manager.private_config_ssh.PrivateConfigSsh', side_effect=[object()]):
+    from manager.recovery import RecoverySsh
+with patch('manager.remote_validator.RemoteValidator') as validator:
+    client = RecoverySsh('safe-alias', '/home/example', expected_hosts=['host.example.invalid'])
+validator.return_value.run_trusted.return_value = b'{"schema_version":1,"items":[]}'
+assert client.list_items() == []
+assert validator.return_value.run_trusted.call_args.args[0] == '/usr/bin/php8.5 /home/example/private/xserver-mail-lineworks/bootstrap/mail-forward-command.php --outbox-list'
+'''
+        result = subprocess.run([sys.executable, '-c', script],
+            cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True, timeout=10)
+        self.assertEqual(0, result.returncode, result.stderr)
+
+    def test_invalid_connection_metadata_is_rejected_before_ssh(self):
+        from manager.recovery import RecoverySsh
+        with patch('manager.remote_validator.RemoteValidator') as validator:
+            for home, hosts in [('/home/example;id', ['host.example.invalid']),
+                                ('/home/example', []),
+                                ('/home/example', ['host.example.invalid'] * 2),
+                                ('/home/example', ['Host.example.invalid'])]:
+                with self.subTest(home=home, hosts=hosts), self.assertRaises(ValueError):
+                    RecoverySsh('safe-alias', home, expected_hosts=hosts)
+        validator.assert_not_called()
+
     def test_manager_menu_16_lists_without_sending(self):
         from manager.manage import MailManager
         class Client:
@@ -16,7 +49,7 @@ class RecoveryTest(unittest.TestCase):
 
     def test_selected_retry_uses_trusted_fixed_command_and_no_automatic_retry(self):
         from manager.recovery import RecoverySsh
-        with patch('manager.private_config_ssh.RemoteValidator') as validator:
+        with patch('manager.remote_validator.RemoteValidator') as validator:
             client = RecoverySsh('safe-alias', '/home/example', expected_hosts=['host.example.invalid'])
         remote = validator.return_value
         remote.run_trusted.return_value = json.dumps({'schema_version': 1, 'items': []}).encode()
@@ -49,7 +82,7 @@ class RecoveryTest(unittest.TestCase):
 
     def test_metadata_rejects_secret_fields_and_invalid_retryability(self):
         from manager.recovery import RecoverySsh
-        with patch('manager.private_config_ssh.RemoteValidator') as validator:
+        with patch('manager.remote_validator.RemoteValidator') as validator:
             client=RecoverySsh('safe-alias','/home/example',expected_hosts=['host.example.invalid'])
         remote=validator.return_value
         for item in [dict(title='secret'), dict(id='a'*64,revision='b'*64,state='review_only',created_at=1,expires_at=604801,completed_chunks=None,total_chunks=None,classification='review_required',retryable=True)]:
