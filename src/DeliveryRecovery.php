@@ -23,12 +23,13 @@ final class DeliveryRecovery
         $claim = $this->outbox->claimSelected($id, $revision, $this->config->notificationTargets);
         $observed = $this->webhook->sendObservedWithCompatibility($claim['title'], $claim['text']);
         $result = $observed->result;
+        $storageFailed = false;
         try {
             // Save delivery first. A later health or logging failure cannot make it replayable.
             $this->outbox->finish($id, $claim['token'], $result);
         } catch (Throwable) {
             $this->safeLog($id, 'outbox_store_failure');
-            throw new \RuntimeException('Private recovery result unavailable');
+            $storageFailed = true;
         }
         try {
             if ($observed->sequence !== null) {
@@ -47,6 +48,11 @@ final class DeliveryRecovery
                 $result->classification, $result->httpStatus, $result->diagnostic,
             );
         } catch (Throwable) {
+        }
+        if ($storageFailed) {
+            // Keep the claim uncertain/non-retryable, but never discard a known
+            // transport outcome from health or diagnostic reporting.
+            throw new \RuntimeException('Private recovery result unavailable');
         }
         return ['schema_version' => 1, 'id' => $id,
             'status' => $result->isSuccess() ? 'delivered' : 'not_delivered'];

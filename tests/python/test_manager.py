@@ -1751,6 +1751,22 @@ class ManagerTest(unittest.TestCase):
         self.assertEqual("リモートリリース: 設定済み", result["latest_log"])
         self.assertNotIn("/private/releases/r1", "\n".join(result.values()))
 
+    def test_diagnostics_separate_last_health_from_live_startup(self):
+        manager, _, _, output = self.make_manager(config={})
+        class Probe:
+            def check_startup(self):
+                raise RuntimeError('private detail must not appear')
+        manager.recovery_client = Probe()
+        result = manager._default_diagnostics()
+        self.assertIn('失敗', result['startup'])
+        self.assertNotIn('private detail', str(result))
+        manager.diagnostic_fn = lambda: dict(result, health='正常')
+        manager.show_diagnostics()
+        rendered = '\n'.join(output)
+        self.assertIn('最終記録の配信状態: 正常', rendered)
+        self.assertIn('起動確認: 失敗', rendered)
+        self.assertIn('現在の送達を保証', rendered)
+
     def test_diagnostics_report_pinned_and_target_drift_without_private_values(self):
         message_hash = "f" * 64
         config = {
@@ -1774,7 +1790,7 @@ class ManagerTest(unittest.TestCase):
         rendered = "\n".join(output)
         self.assertIn("恒久対象: 不一致（API登録 0/1件）", rendered)
         self.assertIn("通知対象: 不一致（API 1件 / リモート設定 2件）", rendered)
-        self.assertIn("配信状態: 状態ファイル不正", rendered)
+        self.assertIn("最終記録の配信状態: 状態ファイル不正", rendered)
         for private in (ADDRESS_A, ADDRESS_B, "private-key-must-not-appear",
                         "private-token", message_hash,
                         "/private/releases/private-release-id"):
@@ -2327,7 +2343,7 @@ class ManagerTest(unittest.TestCase):
                 )
                 manager.private_config_client.health_summary = lambda summary=summary: dict(summary)
                 manager.show_diagnostics()
-                self.assertIn("配信状態: " + expected, output)
+                self.assertIn("最終記録の配信状態: " + expected, output)
 
     def test_diagnostics_report_missing_target_or_command_metadata_as_out_of_sync(self):
         for config in ({"command_path": "/private/mail-forward-command"}, {"notification_targets": [ADDRESS_A]}):
@@ -2508,7 +2524,7 @@ class ManagerTest(unittest.TestCase):
         self.assertIn("同期状態: ok", output)
         self.assertIn("恒久対象: 不明", output)
         self.assertIn("通知対象: 不明", output)
-        self.assertIn("配信状態: 不明", output)
+        self.assertIn("最終記録の配信状態: 不明", output)
         self.assertIn("最新ログ: redacted", output)
 
     def test_cancelled_error_test_callback_returns_false_without_success_message(self):

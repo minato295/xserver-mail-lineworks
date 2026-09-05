@@ -13,7 +13,7 @@ final class StdinFrame
     public const MAX_MESSAGE_BYTES = 10485760;
 
     /** @return array{configJson:string,message:string} */
-    public static function decode($stream): array
+    public static function decode($stream, bool $retainOversizeSentinel = false): array
     {
         if (!is_resource($stream) || self::readExact($stream, strlen(self::MAGIC)) !== self::MAGIC) {
             throw new InvalidArgumentException('Invalid input frame');
@@ -25,7 +25,7 @@ final class StdinFrame
         }
         $configJson = self::readExact($stream, $length['low']);
         $message = stream_get_contents($stream, self::MAX_MESSAGE_BYTES + 1);
-        if (!is_string($message) || strlen($message) > self::MAX_MESSAGE_BYTES) {
+        if (!is_string($message) || (!$retainOversizeSentinel && strlen($message) > self::MAX_MESSAGE_BYTES)) {
             throw new InvalidArgumentException('Invalid input frame');
         }
         return compact('configJson', 'message');

@@ -317,6 +317,50 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertEqual(replacements, len(self.deployer.ftps.events))
 
 
+    def test_upgrade_from_pinned_recovery_generation_resumes_after_helper(self):
+        self.workflow.provision_fixed_runtime(self.source)
+        root = '/home/example/private/xserver-mail-lineworks'
+        baseline = next(entries for name, entries, _ in self.deployer.remote_validator.inspections if name == root)
+        helper = baseline['bootstrap/manage-private-config.php']
+        self.workflow.LEGACY_HELPER_SIZE = helper['size']
+        self.workflow.LEGACY_HELPER_SHA256 = helper['sha256']
+        body = (json.dumps({'schema_version': 1, 'entries': baseline}, sort_keys=True, separators=(',', ':')) + '\n').encode()
+        asset = Path(self.temp.name) / 'reviewed-predecessor.json'
+        asset.write_bytes(body); asset.chmod(0o644)
+        self.workflow.CURRENT_GENERATION_MANIFEST_PATH = asset
+        self.workflow.CURRENT_GENERATION_MANIFEST_MODE = 0o644
+        self.workflow.CURRENT_GENERATION_MANIFEST_SIZE = len(body)
+        self.workflow.CURRENT_GENERATION_MANIFEST_SHA256 = hashlib.sha256(body).hexdigest()
+        previous = {
+            'bootstrap/manage-private-config.php': b'<?php /* recovery helper */\n',
+            'bootstrap/mail-forward-command.php': b'<?php /* recovery bootstrap */\n',
+        }
+        self.workflow.RECOVERY_GENERATION_FILES = {
+            path: {'type': 'file', 'mode': 0o700, 'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
+            for path, data in previous.items()
+        }
+        for path, data in previous.items():
+            self.deployer.ftps.files[self.workflow.PRIVATE_ROOT + '/' + path] = data
+        for file in ('manage-private-config.php', 'stable-mail-entrypoint.php'):
+            (self.source / 'bin' / file).write_text('<?php /* input reporting upgrade */\n')
+        def interrupt(remote):
+            if remote.endswith('/bootstrap/manage-private-config.php'):
+                raise SystemExit('interrupted')
+        self.deployer.ftps.after_replace = interrupt
+        with self.assertRaises(SystemExit):
+            self.workflow.provision_fixed_runtime(self.source)
+        self.deployer.ftps.after_replace = None
+        self.workflow.provision_fixed_runtime(self.source)
+        for path in previous:
+            self.assertEqual(b'<?php /* input reporting upgrade */\n', self.deployer.ftps.files[self.workflow.PRIVATE_ROOT + '/' + path])
+        count = len(self.deployer.ftps.events)
+        self.workflow.provision_fixed_runtime(self.source)
+        self.assertEqual(count, len(self.deployer.ftps.events))
+        self.deployer.ftps.files[self.workflow.PRIVATE_ROOT + '/bootstrap/mail-forward-command.php'] = b'<?php /* unknown */'
+        with self.assertRaises(ReleaseWorkflowError):
+            self.workflow.provision_fixed_runtime(self.source)
+        self.assertEqual(count, len(self.deployer.ftps.events))
+
     def test_template_filtering_does_not_change_immutable_release_validator(self):
         validator = Path(__file__).resolve().parents[2] / "src/ReleaseValidator.php"
         self.assertEqual(
