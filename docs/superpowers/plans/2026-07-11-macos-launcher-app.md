@@ -928,8 +928,8 @@ stable entrypointはlocatorのabsolute releaseを解決し、固定private confi
 ```php
 $result = runStandaloneBootstrap($stable, $locator, "From: test@example.invalid\n\nbody");
 assert($result->exitCode === 0);
-assert($result->argv === ['/usr/bin/php8.5', '/home/account/private/releases/release-abc/bin/mail-to-lineworks.php']);
-assert($result->env['MAIL_NOTIFIER_CONFIG'] === '/home/account/private/config.json');
+assert($result->argv === ['/usr/bin/php8.5', '/home/example/private/releases/release-abc/bin/mail-to-lineworks.php']);
+assert($result->env['MAIL_NOTIFIER_CONFIG'] === '/home/example/private/config.json');
 assert(!str_contains($result->stdout . $result->stderr, 'webhook.worksmobile.com'));
 ```
 

@@ -51,6 +51,8 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+sys.path.insert(0, str(Path.cwd() / "tests"))
+from public_policy import contains_private_environment_path
 
 root = Path.cwd()
 tracked = subprocess.run(
@@ -106,6 +108,8 @@ for relative in files:
         violations.append(f"{relative}: サンプルドメインはexample.invalid配下に限定")
     if known_environment.search(text):
         violations.append(f"{relative}: 既知環境識別子らしき値")
+    if contains_private_environment_path(text, test_fixture=relative.startswith("tests/")):
+        violations.append(f"{relative}: 実環境のアカウントパスらしき値")
     if public_deploy.search(text):
         violations.append(f"{relative}: public_html配備パスらしき値")
     if not relative.startswith("tests/") and system_mail_key_value.search(text):
