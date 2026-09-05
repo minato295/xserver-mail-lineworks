@@ -711,6 +711,7 @@ $splitFilesystem = new NativePrivateStateFilesystem(
         $replacementFilesystem = new NativePrivateStateFilesystem(
             null, null,
             static fn (): array => ['home' => dirname($splitLockDirectory), 'uid' => posix_geteuid()],
+            lockWaitSeconds: 0,
         );
         try {
             $replacementFilesystem->withExclusiveLock($splitLockPath,
